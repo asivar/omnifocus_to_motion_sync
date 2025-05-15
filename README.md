@@ -40,10 +40,7 @@ Update the following dict to map workspaces to Motion schedule names:
 ```python
 WORKSPACE_TO_SCHEDULE_MAP = {
     "🏠 Home": "Personal hours",
-    "💵 Finance": "Anytime (24/7)",
-    "🏤 Google": "Work hours",
-    "🪖 Military": "Military Schedule",
-    "🍇 Valhalla Farms": "Winery Schedule",
+    "Work": "Work horus",
 }
 ```
 
