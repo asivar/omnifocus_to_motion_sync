@@ -20,9 +20,6 @@
     "log_directory": "~/Library/Logs/OmniFocusMotionSync"
   },
   "sequential_project_handling": {
-    "enabled": true,
-    "add_description_hints": true,
-    "boost_first_task_priority": true,
-    "add_blocked_by_notes": true
+    "enabled": true
   }
 }

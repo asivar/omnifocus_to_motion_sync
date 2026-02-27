@@ -49,7 +49,16 @@ def create_config_interactive():
             "ignored_folders": ["Routines", "Reference"],
             "sync_settings": {
                 "api_rate_limit_delay": 0.2,
-                "workspace_processing_delay": 0.5
+                "workspace_processing_delay": 0.5,
+                "default_due_date_offset_days": 14
+            },
+            "paths": {
+                "lock_file": "/tmp/of2motion.lock",
+                "state_file": "motion_hierarchical_mapping.json",
+                "log_directory": "~/Library/Logs/OmniFocusMotionSync"
+            },
+            "sequential_project_handling": {
+                "enabled": True
             }
         }
     else:
@@ -85,7 +94,16 @@ def create_config_interactive():
             "ignored_folders": ["Routines", "Reference"],
             "sync_settings": {
                 "api_rate_limit_delay": 0.2,
-                "workspace_processing_delay": 0.5
+                "workspace_processing_delay": 0.5,
+                "default_due_date_offset_days": 14
+            },
+            "paths": {
+                "lock_file": "/tmp/of2motion.lock",
+                "state_file": "motion_hierarchical_mapping.json",
+                "log_directory": "~/Library/Logs/OmniFocusMotionSync"
+            },
+            "sequential_project_handling": {
+                "enabled": True
             }
         }
     
@@ -106,7 +124,9 @@ def create_config_interactive():
         print("  • Workspace mappings (if OF folder names differ from Motion)")
         print("  • Workspace schedules (for auto-scheduling)")
         print("  • Ignored folders")
-        print("  • API rate limits")
+        print("  • Sync settings (API rate limits, default due date offset)")
+        print("  • Paths (lock file, state file, log directory)")
+        print("  • Sequential project handling")
     except IOError as e:
         print(f"❌ Error saving config: {e}")
         sys.exit(1)
@@ -126,7 +146,13 @@ def validate_config(config_file: str = "config.json"):
         print(f"  Workspace Mappings: {len(config.get('workspace_mapping', {}))}")
         print(f"  Workspace Schedules: {len(config.get('workspace_schedules', {}))}")
         print(f"  Ignored Folders: {config.get('ignored_folders', [])}")
-        print(f"  API Rate Limit Delay: {config.get('sync_settings', {}).get('api_rate_limit_delay')}s")
+        sync = config.get('sync_settings', {})
+        print(f"  API Rate Limit Delay: {sync.get('api_rate_limit_delay')}s")
+        print(f"  Default Due Date Offset: {sync.get('default_due_date_offset_days', 'not set')} days")
+        seq = config.get('sequential_project_handling', {})
+        print(f"  Sequential Projects: {'enabled' if seq.get('enabled') else 'disabled'}")
+        paths = config.get('paths', {})
+        print(f"  Log Directory: {paths.get('log_directory', 'not set')}")
         
         return True
     except json.JSONDecodeError as e:

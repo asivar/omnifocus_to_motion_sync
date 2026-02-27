@@ -4,6 +4,7 @@ List existing Motion workspaces to help configure mapping.
 Usage: python3 list_motion_workspaces.py
 """
 
+import json
 import os
 import sys
 import requests
@@ -38,11 +39,11 @@ def list_motion_workspaces():
                 print(f"Type: {ws.get('type')}")
                 print("-" * 60)
             
-            print("\n📋 Suggested workspace_mapping configuration:\n")
-            print('workspace_mapping = {')
+            print("\n📋 Suggested workspace_mapping for config.json:\n")
+            mapping = {}
             for ws in workspaces:
-                print(f'    "YOUR_OF_FOLDER_NAME": "{ws.get("name")}",')
-            print('}')
+                mapping["YOUR_OF_FOLDER_NAME"] = ws.get("name")
+            print(json.dumps({"workspace_mapping": mapping}, indent=2))
             
         else:
             print(f"❌ Error: HTTP {response.status_code}")

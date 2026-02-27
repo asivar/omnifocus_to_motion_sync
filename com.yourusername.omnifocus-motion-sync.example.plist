@@ -10,7 +10,8 @@
         <!-- Update these paths to match your installation -->
         <string>/path/to/motion-sync/venv/bin/python3</string>
         <string>/path/to/motion-sync/sync_of_to_motion.py</string>
-        <string>--sync-only</string>
+        <string>--config</string>
+        <string>/path/to/motion-sync/config.json</string>
     </array>
 
     <key>EnvironmentVariables</key>
@@ -27,16 +28,18 @@
     <key>RunAtLoad</key>
     <true/>
 
-    <!-- Standard output log -->
+    <!-- Standard output log (LaunchAgents don't expand ~) -->
     <key>StandardOutPath</key>
-    <string>~/Library/Logs/OmniFocusMotionSync/sync.log</string>
+    <string>/Users/YOUR_USERNAME/Library/Logs/OmniFocusMotionSync/sync.log</string>
 
     <!-- Error log -->
     <key>StandardErrorPath</key>
-    <string>~/Library/Logs/OmniFocusMotionSync/error.log</string>
+    <string>/Users/YOUR_USERNAME/Library/Logs/OmniFocusMotionSync/error.log</string>
 
     <!-- Working directory - update to your installation path -->
     <key>WorkingDirectory</key>
     <string>/path/to/motion-sync</string>
+
+    <!-- See also: com.yourusername.omnifocus-motion-healthcheck.example.plist for health monitoring -->
 </dict>
 </plist>

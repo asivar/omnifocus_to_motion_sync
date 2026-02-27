@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
 OmniFocus to Motion Sync Script
-Version: 3.1 - Stable
+Version: 4.0 - Sprint 4 (Polish, Hardening & Optimization)
 
-This script combines:
-1. Motion data mapping creation
-2. OmniFocus to Motion synchronization
-3. Local JSON-based comparison
-4. Automatic data updates
+Bidirectional sync between OmniFocus and Motion with:
+- ID-based task matching
+- Sequential project support
+- Structured logging with correlation IDs
+- State backups with SHA-256 checksums
+- Dry-run mode
+- Sync history tracking
 
-Usage: python3 sync_of_to_motion_hybrid.py [--refresh-mapping] [--sync-only]
+Usage: python3 sync_of_to_motion.py [--refresh-mapping] [--sync-only] [--mapping-only] [--dry-run] [--config FILE]
 """
 
 import os
@@ -17,6 +19,7 @@ import sys
 import json
 import time
 import re
+import html as html_mod
 import uuid
 import hashlib
 import shutil
@@ -66,14 +69,38 @@ def setup_logging(log_dir: str = LOG_DIR, console_level: int = logging.INFO):
     logger.addHandler(console_handler)
 
 
+SYNC_HISTORY_FILE = "sync_history.jsonl"
+
+
+def append_sync_history(run_id: str, duration_seconds: float, dry_run: bool,
+                        forward_stats: Dict, reverse_stats: Dict):
+    """Append one JSON line per sync run to the history file."""
+    record = {
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'run_id': run_id,
+        'duration_seconds': round(duration_seconds, 2),
+        'dry_run': dry_run,
+        'forward': forward_stats,
+        'reverse': reverse_stats,
+    }
+    try:
+        with open(SYNC_HISTORY_FILE, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(record, ensure_ascii=False) + '\n')
+    except IOError as e:
+        logger.warning(f"⚠️  Could not write sync history: {e}")
+
+
 def build_description(body: str = "", tags: Optional[List[str]] = None,
-                      of_url: Optional[str] = None, motion_url: Optional[str] = None) -> str:
+                      of_url: Optional[str] = None, motion_url: Optional[str] = None,
+                      sequence_info: Optional[str] = None) -> str:
     """Build a standardized description/note with metadata below a separator."""
     parts = []
     if body:
         parts.append(body.strip())
 
     metadata = []
+    if sequence_info:
+        metadata.append(sequence_info)
     if tags:
         metadata.append("Tags: " + ", ".join(tags))
     if of_url:
@@ -98,12 +125,13 @@ def extract_body(text: str) -> str:
 
 
 def strip_html(text: str) -> str:
-    """Strip HTML tags from text, converting <br> and </p> to newlines."""
+    """Strip HTML tags and decode entities from text, converting <br> and </p> to newlines."""
     if not text or '<' not in text:
         return text or ""
     text = re.sub(r'<br\s*/?>', '\n', text)
     text = re.sub(r'</p>\s*<p>', '\n\n', text)
     text = re.sub(r'<[^>]+>', '', text)
+    text = html_mod.unescape(text)
     return text.strip()
 
 class Config:
@@ -199,10 +227,7 @@ class Config:
     def sequential_project_handling(self) -> Dict:
         """Get sequential project handling settings."""
         return self.config.get("sequential_project_handling", {
-            "enabled": True,
-            "add_description_hints": True,
-            "boost_first_task_priority": True,
-            "add_blocked_by_notes": True
+            "enabled": True
         })
 
 def acquire_lock(lock_file: str = LOCK_FILE):
@@ -261,6 +286,16 @@ class OFFolder:
         self.name = name
         self.projects = projects or []
 
+# --- Sentinel for 404 responses (falsy, but distinguishable from None) ---
+class _NotFound:
+    """Sentinel returned by _make_request for 404 responses.
+    Falsy so existing `if not result:` checks still work,
+    but distinguishable via `result is NOT_FOUND`."""
+    def __bool__(self): return False
+    def __repr__(self): return 'NOT_FOUND'
+
+NOT_FOUND = _NotFound()
+
 # --- Motion API Interaction Class ---
 class MotionSync:
     """Handles all Motion API operations with proper error handling and rate limiting."""
@@ -301,10 +336,13 @@ class MotionSync:
                 logger.info(f"⏳ Rate limited. Waiting {retry_after} seconds... (attempt {_retry_count + 1}/{cls.MAX_RETRIES})")
                 time.sleep(retry_after)
                 return cls._make_request(method, endpoint, json_data, params, _retry_count=_retry_count + 1)
+            elif response.status_code == 404:
+                logger.debug(f"🔍 404 Not Found on {method} {endpoint}")
+                return NOT_FOUND
             else:
                 logger.error(f"❌ HTTP {response.status_code} on {method} {endpoint}: {response.text}")
                 return None
-                
+
         except requests.exceptions.RequestException as e:
             logger.error(f"❌ Request error on {method} {endpoint}: {e}")
             return None
@@ -325,16 +363,18 @@ class MotionSync:
                                schedule_name_to_use: Optional[str] = None,
                                priority: str = "MEDIUM",
                                labels: Optional[List[str]] = None,
-                               default_due_date_offset: int = 14) -> Optional[Dict]:
+                               default_due_date_offset: int = 14,
+                               sequence_info: Optional[str] = None) -> Optional[Dict]:
         payload = {
             "name": task_name, "projectId": project_id,
             "workspaceId": workspace_id, "priority": priority
         }
-        
+
         desc = build_description(
             body=description or "",
             tags=labels if labels and isinstance(labels, list) else None,
-            of_url=of_task_url
+            of_url=of_task_url,
+            sequence_info=sequence_info
         )
         if desc:
             payload["description"] = desc
@@ -374,12 +414,12 @@ class MotionSync:
 
         logger.debug(f"    M-> Sending update for task {task_id} with payload: {payload}")
         response = cls._make_request("PATCH", f"tasks/{task_id}", json_data=payload)
-        
-        if response is not None:
+
+        if response and response is not NOT_FOUND:
             logger.debug(f" M-> ✨ Successfully updated task (ID: {task_id})")
             return response
         else:
-            logger.error(f"🚨 Error updating task {task_id}. API response was None.")
+            logger.error(f"🚨 Error updating task {task_id}. API returned {'404' if response is NOT_FOUND else 'error'}.")
             return None
 
     @classmethod
@@ -387,10 +427,10 @@ class MotionSync:
         """Mark a task as completed in Motion. Returns True on success."""
         logger.debug(f" M-> Completing task (ID: {task_id})")
         response = cls._make_request('PATCH', f'tasks/{task_id}', json_data={'status': 'completed'})
-        if response is not None:
+        if response and response is not NOT_FOUND:
             logger.debug(f"     M-> ✨ Completed task successfully.")
             return True
-        logger.error(f"     M-> ❌ Failed to complete task.")
+        logger.error(f"     M-> ❌ Failed to complete task ({'404 - task not found' if response is NOT_FOUND else 'API error'}).")
         return False
 
 # --- OmniFocus Manager (Write Operations) ---
@@ -594,15 +634,41 @@ class OmniFocusManager:
 # --- Task ID Mapping Manager ---
 class TaskIDMapper:
     """Manages bidirectional mapping between OmniFocus and Motion task IDs."""
-    
+
     def __init__(self, state_data: Dict):
         self.state_data = state_data
         if 'task_mappings' not in self.state_data:
             self.state_data['task_mappings'] = {}
-    
+        self._rebuild_indexes()
+
+    def _rebuild_indexes(self):
+        """Build reverse lookup dicts for O(1) access."""
+        self._of_to_motion = {}
+        self._motion_to_of = {}
+        for mapping in self.state_data['task_mappings'].values():
+            of_id = mapping.get('of_id')
+            motion_id = mapping.get('motion_id')
+            if of_id:
+                self._of_to_motion[of_id] = motion_id
+            if motion_id:
+                self._motion_to_of[motion_id] = of_id
+
     def add_mapping(self, of_id: str, motion_id: str, workspace: str, project: str, task_name: str,
                     sequence_info: Optional[Dict] = None):
         """Store bidirectional ID mapping with optional sequence metadata."""
+        # Clean up any old mapping for these IDs to prevent ghost entries
+        old_motion = self._of_to_motion.get(of_id)
+        if old_motion and old_motion != motion_id:
+            old_key = self._create_key(of_id, old_motion)
+            self.state_data['task_mappings'].pop(old_key, None)
+            self._motion_to_of.pop(old_motion, None)
+
+        old_of = self._motion_to_of.get(motion_id)
+        if old_of and old_of != of_id:
+            old_key = self._create_key(old_of, motion_id)
+            self.state_data['task_mappings'].pop(old_key, None)
+            self._of_to_motion.pop(old_of, None)
+
         mapping_key = self._create_key(of_id, motion_id)
         mapping = {
             'of_id': of_id,
@@ -615,21 +681,18 @@ class TaskIDMapper:
         if sequence_info:
             mapping.update(sequence_info)
         self.state_data['task_mappings'][mapping_key] = mapping
-    
+        # Maintain indexes
+        self._of_to_motion[of_id] = motion_id
+        self._motion_to_of[motion_id] = of_id
+
     def get_motion_id_from_of(self, of_id: str) -> Optional[str]:
-        """Find Motion ID given OmniFocus ID."""
-        for mapping in self.state_data['task_mappings'].values():
-            if mapping.get('of_id') == of_id:
-                return mapping.get('motion_id')
-        return None
-    
+        """Find Motion ID given OmniFocus ID. O(1) lookup."""
+        return self._of_to_motion.get(of_id)
+
     def get_of_id_from_motion(self, motion_id: str) -> Optional[str]:
-        """Find OmniFocus ID given Motion ID."""
-        for mapping in self.state_data['task_mappings'].values():
-            if mapping.get('motion_id') == motion_id:
-                return mapping.get('of_id')
-        return None
-    
+        """Find OmniFocus ID given Motion ID. O(1) lookup."""
+        return self._motion_to_of.get(motion_id)
+
     def get_mapping(self, of_id: Optional[str] = None, motion_id: Optional[str] = None) -> Optional[Dict]:
         """Get full mapping by either ID."""
         for mapping in self.state_data['task_mappings'].values():
@@ -637,14 +700,14 @@ class TaskIDMapper:
                (motion_id and mapping.get('motion_id') == motion_id):
                 return mapping
         return None
-    
+
     def update_task_name(self, of_id: str, motion_id: str, new_name: str):
         """Update task name in mapping (for rename detection)."""
         mapping_key = self._create_key(of_id, motion_id)
         if mapping_key in self.state_data['task_mappings']:
             self.state_data['task_mappings'][mapping_key]['task_name'] = new_name
             self.state_data['task_mappings'][mapping_key]['updated_at'] = datetime.now(timezone.utc).isoformat()
-    
+
     def remove_mapping(self, of_id: Optional[str] = None, motion_id: Optional[str] = None):
         """Remove mapping when task is deleted."""
         keys_to_remove = []
@@ -652,10 +715,11 @@ class TaskIDMapper:
             if (of_id and mapping.get('of_id') == of_id) or \
                (motion_id and mapping.get('motion_id') == motion_id):
                 keys_to_remove.append(key)
-        
+
         for key in keys_to_remove:
             del self.state_data['task_mappings'][key]
-    
+        self._rebuild_indexes()
+
     @staticmethod
     def _create_key(of_id: str, motion_id: str) -> str:
         """Create composite key for mapping."""
@@ -765,8 +829,9 @@ class StateManager:
 
 # --- Main Sync Class ---
 class MotionHybridSync:
-    def __init__(self, api_key: str, config: Optional[Config] = None):
+    def __init__(self, api_key: str, config: Optional[Config] = None, dry_run: bool = False):
         self.api_key = api_key
+        self.dry_run = dry_run
 
         # Load configuration (or use provided config object)
         self.config = config if config else Config()
@@ -880,7 +945,10 @@ class MotionHybridSync:
             time.sleep(self.config.workspace_processing_delay)
 
         logger.info(f"\n🎯 HIERARCHICAL MAPPING COMPLETE! Workspaces: {len(workspaces)}, Projects: {total_projects}, Tasks: {total_tasks}")
-        self.save_motion_data_to_file(mapping_data, update_timestamp=False)
+        if not self.dry_run:
+            self.save_motion_data_to_file(mapping_data, update_timestamp=False)
+        else:
+            logger.info("[DRY RUN] Would save mapping data to file")
         return mapping_data
 
     def load_motion_data_from_file(self) -> Dict:
@@ -1026,8 +1094,8 @@ class MotionHybridSync:
             logger.error(f"🚨 Unexpected OF error: {e}")
             return []
 
-    def sync_omnifocus_to_motion(self):
-        """Real OmniFocus to Motion synchronization using local JSON data."""
+    def sync_omnifocus_to_motion(self) -> Dict:
+        """Real OmniFocus to Motion synchronization using local JSON data. Returns forward stats."""
         logger.info(" Starting OmniFocus to Motion synchronization...")
         local_data = self.load_motion_data_from_file()
         # Load OF structure only if not already loaded (standalone mode)
@@ -1035,9 +1103,11 @@ class MotionHybridSync:
             self.of_structure = self.load_omnifocus_structure()
         if not self.of_structure:
             logger.error("❌ Failed to load OmniFocus structure. Cannot proceed with sync.")
-            return
-        self.perform_sync_comparison_from_structure(local_data)
+            return {'projects_created': 0, 'tasks_created': 0, 'tasks_updated': 0,
+                    'tasks_completed': 0, 'failed': 0}
+        forward_stats = self.perform_sync_comparison_from_structure(local_data)
         logger.info("✅ Synchronization completed!")
+        return forward_stats
 
     def refresh_motion_task_statuses(self, motion_data: Dict):
         """Check mapped tasks for completions in Motion.
@@ -1095,8 +1165,8 @@ class MotionHybridSync:
 
             # Fetch individual task status from Motion API
             task_data = MotionSync._make_request("GET", f"tasks/{motion_id}")
-            if not task_data:
-                # 404 or other error — task was deleted in Motion.
+            if task_data is NOT_FOUND:
+                # 404 — task was genuinely deleted in Motion.
                 # Mark local copy as completed so we stop checking it.
                 proj_tasks = motion_data.get('workspaces', {}).get(ws_name, {}).get('projects', {}).get(proj_name, {}).get('tasks', {})
                 if task_name in proj_tasks:
@@ -1104,6 +1174,11 @@ class MotionHybridSync:
                     proj_tasks[task_name]['completed'] = True
                 stale_count += 1
                 logger.debug(f"   🗑️ Task '{task_name}' no longer exists in Motion (deleted/archived)")
+                time.sleep(self.config.api_rate_limit_delay)
+                continue
+            if task_data is None:
+                # Non-404 API error (500, timeout, etc.) — skip, don't mark completed
+                logger.warning(f"   ⚠️  API error checking '{task_name}' — skipping (won't mark completed)")
                 time.sleep(self.config.api_rate_limit_delay)
                 continue
 
@@ -1126,7 +1201,7 @@ class MotionHybridSync:
         if stale_count > 0:
             logger.info(f"   🗑️ Cleaned up {stale_count} stale task(s) no longer in Motion")
         logger.info(f"   📊 Found {completed_count} newly completed task(s) in Motion")
-        if completed_count > 0 or stale_count > 0:
+        if (completed_count > 0 or stale_count > 0) and not self.dry_run:
             self.save_motion_data_to_file(motion_data, update_timestamp=False)
         return motion_data
 
@@ -1174,14 +1249,15 @@ class MotionHybridSync:
 
         if new_task_count > 0:
             logger.info(f"   📊 Discovered {new_task_count} new task(s) from Motion API")
-            self.save_motion_data_to_file(motion_data, update_timestamp=False)
+            if not self.dry_run:
+                self.save_motion_data_to_file(motion_data, update_timestamp=False)
         else:
             logger.info("   📊 No new tasks found in Motion")
 
         return motion_data
 
-    def sync_motion_to_omnifocus(self):
-        """Sync Motion changes back to OmniFocus (reverse sync)."""
+    def sync_motion_to_omnifocus(self) -> Dict:
+        """Sync Motion changes back to OmniFocus (reverse sync). Returns reverse stats."""
         logger.info("\n🔄 Starting Motion → OmniFocus synchronization...")
 
         # Refresh from Motion API to pick up changes and new tasks
@@ -1194,15 +1270,16 @@ class MotionHybridSync:
             self.of_structure = self.load_omnifocus_structure()
         if not self.of_structure:
             logger.error("❌ Failed to load OmniFocus structure. Cannot proceed with reverse sync.")
-            return
+            return {'tasks_completed': 0, 'tasks_created': 0, 'failed': 0}
 
         # Create reverse sync plan (may add auto-mappings to id_mapper)
         reverse_sync_plan = self.create_reverse_sync_plan(motion_data, self.of_structure)
 
         # Execute reverse sync, passing motion_data to avoid re-loading (which discards auto-mappings)
-        self.execute_reverse_sync_plan(reverse_sync_plan, motion_data)
+        reverse_stats = self.execute_reverse_sync_plan(reverse_sync_plan, motion_data)
 
         logger.info("✅ Reverse synchronization completed!")
+        return reverse_stats
     
     def create_reverse_sync_plan(self, motion_data: Dict, of_structure: List[OFFolder]) -> Dict:
         """
@@ -1308,9 +1385,13 @@ class MotionHybridSync:
         logger.info(f"   📊 Tasks to create in OmniFocus: {len(reverse_sync_plan['of_tasks_to_create'])}")
         return reverse_sync_plan
     
-    def execute_reverse_sync_plan(self, reverse_sync_plan: Dict, motion_data: Optional[Dict] = None) -> bool:
-        """Execute Motion → OmniFocus sync plan."""
-        logger.info("⚡ Executing reverse sync plan...")
+    def execute_reverse_sync_plan(self, reverse_sync_plan: Dict, motion_data: Optional[Dict] = None) -> Dict:
+        """Execute Motion → OmniFocus sync plan. Returns stats dict."""
+        dry = self.dry_run
+        if dry:
+            logger.info("⚡ Executing reverse sync plan [DRY RUN]...")
+        else:
+            logger.info("⚡ Executing reverse sync plan...")
 
         completed_count = 0
         created_count = 0
@@ -1325,15 +1406,17 @@ class MotionHybridSync:
             task_name = task_data['task_name']
             of_id = task_data['of_id']
 
-            logger.info(f"   🔄 Completing OF task: '{task_name}'...")
-
-            success = OmniFocusManager.complete_task(of_id)
-
-            if success:
+            if dry:
                 completed_count += 1
-                logger.info(f"      ✅ Completed in OmniFocus")
+                logger.info(f"   [DRY RUN] Would complete OF task: '{task_name}'")
             else:
-                failed_count += 1
+                logger.info(f"   🔄 Completing OF task: '{task_name}'...")
+                success = OmniFocusManager.complete_task(of_id)
+                if success:
+                    completed_count += 1
+                    logger.info(f"      ✅ Completed in OmniFocus")
+                else:
+                    failed_count += 1
 
         # Create new tasks in OmniFocus
         for task_data in reverse_sync_plan['of_tasks_to_create']:
@@ -1342,82 +1425,82 @@ class MotionHybridSync:
             motion_id = task_data['motion_id']
             ws_name = task_data['workspace']
 
-            logger.info(f"   ➕ Creating OF task: '{task_name}' in '{proj_name}'...")
-
-            # Build note with Motion link
-            ws_id = motion_data.get('workspaces', {}).get(ws_name, {}).get('id', '')
-            proj_id = motion_data.get('workspaces', {}).get(ws_name, {}).get('projects', {}).get(proj_name, {}).get('id', '')
-            motion_url = f"https://app.usemotion.com/web/pm/workspaces/{ws_id}/projects/{proj_id}/views/default?task={motion_id}"
-
-            desc_body = strip_html(extract_body(task_data.get('description', '') or ''))
-            note = build_description(body=desc_body, motion_url=motion_url)
-
-            # Map Motion priority to OF flagged
-            flagged = task_data.get('priority') == 'ASAP'
-
-            # Normalize due_date to YYYY-MM-DD (Motion returns full ISO datetime)
-            raw_due = task_data.get('due_date') or ''
-            of_due_date = raw_due[:10] if raw_due else None
-
-            new_of_id = OmniFocusManager.create_task(
-                project_name=proj_name,
-                task_name=task_name,
-                note=note,
-                due_date=of_due_date,
-                flagged=flagged,
-                estimated_minutes=task_data.get('duration')
-            )
-
-            if new_of_id:
+            if dry:
                 created_count += 1
-                logger.info(f"      ✅ Created in OmniFocus (ID: {new_of_id[:8]}...)")
-
-                # Store bidirectional mapping
-                if self.id_mapper:
-                    self.id_mapper.add_mapping(
-                        of_id=new_of_id,
-                        motion_id=motion_id,
-                        workspace=ws_name,
-                        project=proj_name,
-                        task_name=task_name
-                    )
-
-                # Add OF link to Motion task description
-                motion_task = self._find_motion_task_in_data(motion_data, motion_id)
-                if motion_task:
-                    desc = motion_task.get('description', '') or ''
-                    of_url = f"omnifocus:///task/{new_of_id}"
-                    if 'omnifocus:///' not in desc.lower():
-                        body = extract_body(desc)
-                        new_desc = build_description(body=body, of_url=of_url)
-                        MotionSync.update_task(motion_id, {'description': new_desc})
-                        time.sleep(self.config.api_rate_limit_delay)
+                logger.info(f"   [DRY RUN] Would create OF task: '{task_name}' in '{proj_name}'")
             else:
-                failed_count += 1
+                logger.info(f"   ➕ Creating OF task: '{task_name}' in '{proj_name}'...")
 
-        # Always save - auto-mappings from create_reverse_sync_plan need persisting
-        has_changes = created_count > 0 or completed_count > 0
-        self.save_motion_data_to_file(motion_data, update_timestamp=has_changes)
+                # Build note with Motion link
+                ws_id = motion_data.get('workspaces', {}).get(ws_name, {}).get('id', '')
+                proj_id = motion_data.get('workspaces', {}).get(ws_name, {}).get('projects', {}).get(proj_name, {}).get('id', '')
+                motion_url = f"https://app.usemotion.com/web/pm/workspaces/{ws_id}/projects/{proj_id}/views/default?task={motion_id}"
+
+                desc_body = strip_html(extract_body(task_data.get('description', '') or ''))
+                note = build_description(body=desc_body, motion_url=motion_url)
+
+                flagged = task_data.get('priority') == 'ASAP'
+                raw_due = task_data.get('due_date') or ''
+                of_due_date = raw_due[:10] if raw_due else None
+
+                new_of_id = OmniFocusManager.create_task(
+                    project_name=proj_name,
+                    task_name=task_name,
+                    note=note,
+                    due_date=of_due_date,
+                    flagged=flagged,
+                    estimated_minutes=task_data.get('duration')
+                )
+
+                if new_of_id:
+                    created_count += 1
+                    logger.info(f"      ✅ Created in OmniFocus (ID: {new_of_id[:8]}...)")
+
+                    if self.id_mapper:
+                        self.id_mapper.add_mapping(
+                            of_id=new_of_id,
+                            motion_id=motion_id,
+                            workspace=ws_name,
+                            project=proj_name,
+                            task_name=task_name
+                        )
+
+                    motion_task = self._find_motion_task_in_data(motion_data, motion_id)
+                    if motion_task:
+                        desc = motion_task.get('description', '') or ''
+                        of_url = f"omnifocus:///task/{new_of_id}"
+                        if 'omnifocus:///' not in desc.lower():
+                            body = extract_body(desc)
+                            new_desc = build_description(body=body, of_url=of_url)
+                            MotionSync.update_task(motion_id, {'description': new_desc})
+                            time.sleep(self.config.api_rate_limit_delay)
+                else:
+                    failed_count += 1
+
+        if not dry:
+            # Always save - auto-mappings from create_reverse_sync_plan need persisting
+            has_changes = created_count > 0 or completed_count > 0
+            self.save_motion_data_to_file(motion_data, update_timestamp=has_changes)
 
         logger.info(f"\n📊 Reverse Sync Results:")
         logger.info(f"   ✅ Completed: {completed_count}")
         logger.info(f"   ➕ Created: {created_count}")
         if failed_count > 0:
             logger.error(f"   ❌ Failed: {failed_count}")
-        else:
-            logger.info(f"   ❌ Failed: {failed_count}")
 
-        return failed_count == 0
+        return {'tasks_completed': completed_count, 'tasks_created': created_count, 'failed': failed_count}
 
-    def perform_sync_comparison_from_structure(self, motion_data: Dict):
-        """Perform sync comparison using the loaded OmniFocus structure."""
+    def perform_sync_comparison_from_structure(self, motion_data: Dict) -> Dict:
+        """Perform sync comparison using the loaded OmniFocus structure. Returns forward stats."""
         logger.debug("🔍 Performing sync comparison from OF structure...")
         try:
             sync_plan = self.create_sync_plan_from_structure(motion_data)
-            self.execute_sync_plan(sync_plan, motion_data)
+            return self.execute_sync_plan(sync_plan, motion_data)
         except Exception as e:
             logger.error(f"❌ Error during sync comparison: {e}")
             logger.debug(traceback.format_exc())
+            return {'projects_created': 0, 'tasks_created': 0, 'tasks_updated': 0,
+                    'tasks_completed': 0, 'failed': 1}
 
     def create_sync_plan_from_structure(self, motion_data: Dict) -> Dict:
         """Create a sync plan by comparing individual task modification times."""
@@ -1510,18 +1593,45 @@ class MotionHybridSync:
                         sync_plan['tasks_to_create'].append(task_entry)
 
         # Apply sequential project hints before finalizing the plan
-        self._apply_sequential_hints(sync_plan, self.of_structure)
+        self._apply_sequential_hints(sync_plan, self.of_structure, motion_data)
 
         logger.info(f"\n📋 Sync Plan Summary:")
         for key, value in sync_plan.items(): logger.info(f"   {key.replace('_', ' ').title()}: {len(value)}")
         return sync_plan
     
-    def _apply_sequential_hints(self, sync_plan: Dict, of_structure: List[OFFolder]):
-        """Apply sequential project hints to tasks being created or updated.
+    def _build_seq_metadata(self, position: int, total: int, incomplete_tasks: list) -> str:
+        """Build sequence metadata text for below-the-line placement in descriptions."""
+        is_first = (position == 0)
+        lines = [f"Sequential: Task {position + 1} of {total}"]
+        if not is_first:
+            blocker = incomplete_tasks[position - 1]
+            lines.append(f"Blocked by: {blocker.name}")
+        return "\n".join(lines)
 
-        For sequential projects, modifies task data to include:
-        - Description hints showing sequence position and blocked-by notes
-        - Priority escalation for the first incomplete task
+    def _strip_seq_hints(self, text: str) -> str:
+        """Remove existing sequential hint lines from text (body or metadata)."""
+        if not text:
+            return ""
+        lines = text.split('\n')
+        clean = [l for l in lines if not l.startswith('⚡ Sequential:') and not l.startswith('Sequential:') and not l.startswith('Blocked by:')]
+        return '\n'.join(clean).strip()
+
+    def _extract_seq_metadata(self, desc: str) -> Optional[str]:
+        """Extract existing sequence metadata from a description's metadata section."""
+        if not desc or METADATA_SEPARATOR not in desc:
+            return None
+        metadata_section = desc.split(METADATA_SEPARATOR, 1)[1]
+        lines = metadata_section.strip().split('\n')
+        seq_lines = [l.strip() for l in lines if l.strip().startswith('Sequential:') or l.strip().startswith('Blocked by:')]
+        return "\n".join(seq_lines) if seq_lines else None
+
+    def _apply_sequential_hints(self, sync_plan: Dict, of_structure: List[OFFolder], motion_data: Dict):
+        """Apply sequential project metadata to task descriptions (below the separator line).
+
+        For sequential projects:
+        - Stores sequence position and blocked-by info as metadata below the ═══ separator
+        - Persists sequence metadata to task mappings for reference
+        - Injects description updates for existing Motion tasks with missing/outdated metadata
         """
         seq_config = self.config.sequential_project_handling
         if not seq_config.get('enabled', True):
@@ -1539,7 +1649,7 @@ class MotionHybridSync:
         if not sequential_projects:
             return
 
-        # Apply hints to tasks_to_create
+        # --- Phase 1: Tag tasks_to_create with sequence metadata ---
         for task_entry in sync_plan.get('tasks_to_create', []):
             project_key = (task_entry.get('workspace', ''), task_entry.get('project', ''))
             if project_key not in sequential_projects:
@@ -1550,7 +1660,6 @@ class MotionHybridSync:
             if not task_of_id:
                 continue
 
-            # Find this task's position in the sequence
             position = None
             for i, t in enumerate(incomplete_tasks):
                 if t.id == task_of_id:
@@ -1560,7 +1669,6 @@ class MotionHybridSync:
                 continue
 
             total = len(incomplete_tasks)
-            is_first = (position == 0)
 
             # Store sequence metadata for mapping persistence
             task_entry['sequence_position'] = position + 1
@@ -1569,65 +1677,83 @@ class MotionHybridSync:
             if position < total - 1:
                 task_entry['blocks'] = [incomplete_tasks[position + 1].id]
 
-            # Priority escalation: boost first incomplete task
-            if seq_config.get('boost_first_task_priority', True):
-                if is_first:
-                    current = task_entry.get('of_priority') or 'medium'
-                    boost_map = {'low': 'medium', 'medium': 'high'}
-                    boosted = boost_map.get(current.lower())
-                    if boosted:
-                        task_entry['of_priority'] = boosted
+            # Store sequence metadata text — will be placed below separator by build_description
+            task_entry['sequence_info'] = self._build_seq_metadata(position, total, incomplete_tasks)
 
-            # Description hints
-            if seq_config.get('add_description_hints', True):
-                hint_lines = [f"⚡ Sequential: Task {position + 1} of {total}"]
-                if seq_config.get('add_blocked_by_notes', True) and not is_first:
-                    blocker = incomplete_tasks[position - 1]
-                    hint_lines.append(f"Blocked by: {blocker.name}")
-
-                existing_note = task_entry.get('note', '') or ''
-                seq_hint = "\n".join(hint_lines)
-                if seq_hint not in existing_note:
-                    task_entry['note'] = (seq_hint + "\n\n" + existing_note).strip() if existing_note else seq_hint
-
-        # Build reverse mapping: Motion workspace name -> OF folder name
+        # --- Phase 2: Ensure existing Motion tasks have correct sequence metadata ---
         reverse_ws_mapping = {v: k for k, v in self.workspace_mapping.items()}
+        tasks_being_created = {te.get('of_id') for te in sync_plan.get('tasks_to_create', []) if te.get('of_id')}
+        tasks_being_updated = {te.get('motion_task_id') for te in sync_plan.get('tasks_to_update', [])}
 
-        # Apply hints to tasks_to_update (for tasks already in Motion whose sequence position changed)
-        for task_entry in sync_plan.get('tasks_to_update', []):
-            task_name = task_entry.get('name', '')
-            project_name = task_entry.get('project', '')
-            motion_workspace = task_entry.get('workspace', '')
-
-            # Reverse-map Motion workspace name to OF folder name for lookup
-            of_folder = reverse_ws_mapping.get(motion_workspace, motion_workspace)
-
-            # Find the matching sequential project by both folder and project name
-            matching_key = (of_folder, project_name)
-            if matching_key not in sequential_projects:
+        for project_key, incomplete_tasks in sequential_projects.items():
+            folder_name, project_name = project_key
+            motion_workspace_name = self.workspace_mapping.get(folder_name, folder_name)
+            motion_ws_data = motion_data.get('workspaces', {}).get(motion_workspace_name, {})
+            motion_proj = motion_ws_data.get('projects', {}).get(project_name, {})
+            project_tasks = motion_proj.get('tasks', {})
+            if not project_tasks:
                 continue
 
-            incomplete_tasks = sequential_projects[matching_key]
+            total = len(incomplete_tasks)
+            for position, of_task in enumerate(incomplete_tasks):
+                if of_task.id in tasks_being_created:
+                    continue  # Will get metadata in Phase 1
 
-            # Find position by name (we don't have of_id in update entries)
-            position = None
-            for i, t in enumerate(incomplete_tasks):
-                if t.name.strip() == task_name:
-                    position = i
-                    break
-            if position is None:
-                continue
+                task_name = of_task.name.strip()
+                motion_task = project_tasks.get(task_name)
+                if not motion_task:
+                    continue
 
-            is_first = (position == 0)
+                motion_id = motion_task.get('id')
+                expected_metadata = self._build_seq_metadata(position, total, incomplete_tasks)
 
-            # Boost first task priority
-            if seq_config.get('boost_first_task_priority', True) and is_first:
-                updates = task_entry.setdefault('updates', {})
-                current_priority = updates.get('priority', 'MEDIUM')
-                boost_map = {'LOW': 'MEDIUM', 'MEDIUM': 'HIGH'}
-                boosted = boost_map.get(current_priority.upper())
-                if boosted:
-                    updates['priority'] = boosted
+                # Check current description for existing sequence metadata
+                current_desc = strip_html(motion_task.get('description', '') or '')
+                existing_metadata = self._extract_seq_metadata(current_desc)
+
+                # Also check for old-style body hints (⚡ Sequential:) that need migration
+                current_body = extract_body(current_desc)
+                has_old_body_hints = '⚡ Sequential:' in current_body or current_body.startswith('Sequential:')
+
+                needs_update = (existing_metadata != expected_metadata) or has_old_body_hints
+
+                if not needs_update:
+                    continue
+
+                # Build clean description: strip old hints from body, put metadata below line
+                clean_body = self._strip_seq_hints(current_body)
+                of_tags = getattr(of_task, 'contexts', []) or []
+                of_url = getattr(of_task, 'url', None)
+                new_desc = build_description(
+                    body=clean_body, tags=of_tags if of_tags else None,
+                    of_url=of_url, sequence_info=expected_metadata
+                )
+
+                if motion_id in tasks_being_updated:
+                    # Enrich existing update entry — merge with any pending body changes
+                    for te in sync_plan.get('tasks_to_update', []):
+                        if te.get('motion_task_id') == motion_id:
+                            existing_desc_update = te.get('updates', {}).get('description')
+                            if existing_desc_update:
+                                # Pending body change exists — use its body with our sequence metadata
+                                updated_body = extract_body(existing_desc_update)
+                                merged_clean = self._strip_seq_hints(updated_body)
+                                te['updates']['description'] = build_description(
+                                    body=merged_clean, tags=of_tags if of_tags else None,
+                                    of_url=of_url, sequence_info=expected_metadata
+                                )
+                            else:
+                                te.setdefault('updates', {})['description'] = new_desc
+                            break
+                else:
+                    logger.info(f"   ↪️  Updating sequence metadata for '{task_name}' (description)")
+                    sync_plan['tasks_to_update'].append({
+                        'motion_task_id': motion_id,
+                        'name': task_name,
+                        'updates': {'description': new_desc},
+                        'workspace': motion_workspace_name,
+                        'project': project_name
+                    })
 
     def _check_task_for_updates(self, of_task: OFTask, motion_task: Dict, sync_plan: Dict,
                                project_name: str, workspace_name: str, full_check: bool = True):
@@ -1663,8 +1789,9 @@ class MotionHybridSync:
                 field_changes.append("duration")
 
             # Description: compare body only (strip metadata from both sides)
+            # Motion returns HTML in descriptions — strip before comparing
             of_note_body = extract_body(getattr(of_task, 'note', None) or '')
-            motion_desc_body = extract_body(motion_task.get('description', '') or '')
+            motion_desc_body = extract_body(strip_html(motion_task.get('description', '') or ''))
             if of_note_body != motion_desc_body:
                 of_tags = getattr(of_task, 'contexts', []) or []
                 of_url = getattr(of_task, 'url', None)
@@ -1684,114 +1811,145 @@ class MotionHybridSync:
                 'project': project_name
             })
 
-    def execute_sync_plan(self, sync_plan: Dict, motion_data: Dict) -> bool:
-        """Execute the sync plan by creating/updating items in Motion."""
-        logger.info("⚡ Executing sync plan...")
+    def execute_sync_plan(self, sync_plan: Dict, motion_data: Dict) -> Dict:
+        """Execute the sync plan by creating/updating items in Motion.
+        Returns stats dict with counts of operations performed."""
+        dry = self.dry_run
+        if dry:
+            logger.info("⚡ Executing sync plan [DRY RUN]...")
+        else:
+            logger.info("⚡ Executing sync plan...")
+        stats = {'projects_created': 0, 'tasks_created': 0, 'tasks_updated': 0,
+                 'tasks_completed': 0, 'failed': 0}
         try:
             # ❌ REMOVED: Motion API doesn't support creating workspaces
             # Workspaces must be created manually in Motion UI
             for workspace_name in sync_plan['workspaces_to_create']:
                 logger.warning(f"⚠️  Workspace '{workspace_name}' doesn't exist in Motion.")
                 logger.info(f"   → Please create it manually in Motion, or map it to an existing workspace.")
-                # Skip creating projects for non-existent workspaces
                 continue
-            
+
             for project_data in sync_plan['projects_to_create']:
                 project_name = project_data['name']
-                of_folder_name = project_data['workspace']  # Original OmniFocus folder name
-                motion_workspace_name = project_data.get('motion_workspace', of_folder_name)  # Mapped Motion workspace
-                
+                of_folder_name = project_data['workspace']
+                motion_workspace_name = project_data.get('motion_workspace', of_folder_name)
+
                 if motion_workspace_name in motion_data['workspaces']:
-                    workspace_id = motion_data['workspaces'][motion_workspace_name]['id']
-                    created_proj = MotionSync.create_project_in_workspace(workspace_id, project_name)
-                    if created_proj and created_proj.get('id'):
-                        # Store under Motion workspace name
-                        motion_data['workspaces'][motion_workspace_name]['projects'][project_name] = {'id': created_proj['id'], 'tasks': {}}
-                        logger.info(f"   ✅ Created project '{project_name}' in Motion workspace '{motion_workspace_name}'")
+                    if dry:
+                        stats['projects_created'] += 1
+                        logger.info(f"   [DRY RUN] Would create project '{project_name}' in '{motion_workspace_name}'")
+                    else:
+                        workspace_id = motion_data['workspaces'][motion_workspace_name]['id']
+                        created_proj = MotionSync.create_project_in_workspace(workspace_id, project_name)
+                        if created_proj and created_proj.get('id'):
+                            motion_data['workspaces'][motion_workspace_name]['projects'][project_name] = {'id': created_proj['id'], 'tasks': {}}
+                            stats['projects_created'] += 1
+                            logger.info(f"   ✅ Created project '{project_name}' in Motion workspace '{motion_workspace_name}'")
+                        else:
+                            stats['failed'] += 1
                 else:
                     logger.warning(f"   ⚠️  Skipping project '{project_name}' - workspace '{motion_workspace_name}' not found")
 
             for task_data in sync_plan['tasks_to_create']:
                 task_name = task_data['name']
                 project_name = task_data['project']
-                of_folder_name = task_data['workspace']  # Original OmniFocus folder
-                
-                # Map to Motion workspace
+                of_folder_name = task_data['workspace']
                 motion_workspace_name = self.workspace_mapping.get(of_folder_name, of_folder_name)
-                
-                if motion_workspace_name in motion_data['workspaces'] and project_name in motion_data['workspaces'][motion_workspace_name]['projects']:
-                    project_id = motion_data['workspaces'][motion_workspace_name]['projects'][project_name]['id']
-                    
-                    # ✅ Get OmniFocus task ID for mapping
-                    of_task_id = task_data.get('of_id')
-                    
-                    created_task = self._create_task(task_name, project_id, task_data, motion_data, motion_workspace_name)
-                    if created_task:
-                        motion_data['workspaces'][motion_workspace_name]['projects'][project_name]['tasks'][task_name] = created_task
-                        
-                        # ✅ Store bidirectional ID mapping
-                        if of_task_id and created_task.get('id') and self.id_mapper:
-                            # Include sequence info for tasks in sequential projects
-                            seq_info = None
-                            if task_data.get('sequential_project'):
-                                seq_info = {
-                                    'sequential_project': True,
-                                    'sequence_position': task_data.get('sequence_position'),
-                                    'blocks': task_data.get('blocks', []),
-                                    'blocked_by': task_data.get('blocked_by', []),
-                                }
-                            self.id_mapper.add_mapping(
-                                of_id=of_task_id,
-                                motion_id=created_task['id'],
-                                workspace=motion_workspace_name,
-                                project=project_name,
-                                task_name=task_name,
-                                sequence_info=seq_info
-                            )
-                            logger.info(f"      📎 Mapped OF:{of_task_id[:8]}... → Motion:{created_task['id'][:8]}...")
 
-                            # Write Motion link back to OmniFocus notes
-                            workspace_id = motion_data['workspaces'][motion_workspace_name]['id']
-                            motion_url = f"https://app.usemotion.com/web/pm/workspaces/{workspace_id}/projects/{project_id}/views/default?task={created_task['id']}"
-                            of_note_body = extract_body(task_data.get('note', '') or '')
-                            new_note = build_description(
-                                body=of_note_body,
-                                motion_url=motion_url
-                            )
-                            OmniFocusManager.update_task(of_task_id, {'note': new_note})
+                if motion_workspace_name in motion_data['workspaces'] and project_name in motion_data['workspaces'][motion_workspace_name]['projects']:
+                    if dry:
+                        stats['tasks_created'] += 1
+                        logger.info(f"   [DRY RUN] Would create task '{task_name}' in '{project_name}'")
+                    else:
+                        project_id = motion_data['workspaces'][motion_workspace_name]['projects'][project_name]['id']
+                        of_task_id = task_data.get('of_id')
+
+                        created_task = self._create_task(task_name, project_id, task_data, motion_data, motion_workspace_name)
+                        if created_task:
+                            stats['tasks_created'] += 1
+                            motion_data['workspaces'][motion_workspace_name]['projects'][project_name]['tasks'][task_name] = created_task
+
+                            if of_task_id and created_task.get('id') and self.id_mapper:
+                                seq_info = None
+                                if task_data.get('sequential_project'):
+                                    seq_info = {
+                                        'sequential_project': True,
+                                        'sequence_position': task_data.get('sequence_position'),
+                                        'blocks': task_data.get('blocks', []),
+                                        'blocked_by': task_data.get('blocked_by', []),
+                                    }
+                                self.id_mapper.add_mapping(
+                                    of_id=of_task_id,
+                                    motion_id=created_task['id'],
+                                    workspace=motion_workspace_name,
+                                    project=project_name,
+                                    task_name=task_name,
+                                    sequence_info=seq_info
+                                )
+                                logger.info(f"      📎 Mapped OF:{of_task_id[:8]}... → Motion:{created_task['id'][:8]}...")
+
+                                workspace_id = motion_data['workspaces'][motion_workspace_name]['id']
+                                motion_url = f"https://app.usemotion.com/web/pm/workspaces/{workspace_id}/projects/{project_id}/views/default?task={created_task['id']}"
+                                of_note_body = extract_body(task_data.get('note', '') or '')
+                                new_note = build_description(body=of_note_body, motion_url=motion_url)
+                                OmniFocusManager.update_task(of_task_id, {'note': new_note})
+                        else:
+                            stats['failed'] += 1
 
             for task_data in sync_plan['tasks_to_update']:
-                updated_task_response = MotionSync.update_task(task_data['motion_task_id'], task_data['updates'])
-                if updated_task_response:
-                    workspace_name = task_data['workspace']
-                    project_name = task_data['project']
-                    task_name = task_data['name']
-                    if workspace_name in motion_data['workspaces'] and project_name in motion_data['workspaces'][workspace_name]['projects']:
-                        motion_data['workspaces'][workspace_name]['projects'][project_name]['tasks'][task_name] = updated_task_response
+                if dry:
+                    stats['tasks_updated'] += 1
+                    logger.info(f"   [DRY RUN] Would update task '{task_data['name']}' ({', '.join(task_data['updates'].keys())})")
+                else:
+                    updated_task_response = MotionSync.update_task(task_data['motion_task_id'], task_data['updates'])
+                    if updated_task_response:
+                        stats['tasks_updated'] += 1
+                        workspace_name = task_data['workspace']
+                        project_name = task_data['project']
+                        task_name = task_data['name']
+                        if workspace_name in motion_data['workspaces'] and project_name in motion_data['workspaces'][workspace_name]['projects']:
+                            motion_data['workspaces'][workspace_name]['projects'][project_name]['tasks'][task_name] = updated_task_response
+                    else:
+                        stats['failed'] += 1
 
             for task_data in sync_plan['tasks_to_complete']:
-                success = MotionSync.complete_task(task_data['motion_task_id'])
-                if success:
-                    workspace_name = task_data['workspace']
-                    project_name = task_data['project']
-                    task_name = task_data['name']
-                    if workspace_name in motion_data['workspaces'] and \
-                       project_name in motion_data['workspaces'][workspace_name]['projects'] and \
-                       task_name in motion_data['workspaces'][workspace_name]['projects'][project_name]['tasks']:
-                        
-                        motion_data['workspaces'][workspace_name]['projects'][project_name]['tasks'][task_name]['status'] = {'name': 'Completed', 'isResolvedStatus': True}
-                        motion_data['workspaces'][workspace_name]['projects'][project_name]['tasks'][task_name]['updatedTime'] = datetime.now(timezone.utc).isoformat()
+                if dry:
+                    stats['tasks_completed'] += 1
+                    logger.info(f"   [DRY RUN] Would complete task '{task_data['name']}'")
+                else:
+                    success = MotionSync.complete_task(task_data['motion_task_id'])
+                    if success:
+                        stats['tasks_completed'] += 1
+                        workspace_name = task_data['workspace']
+                        project_name = task_data['project']
+                        task_name = task_data['name']
+                        if workspace_name in motion_data['workspaces'] and \
+                           project_name in motion_data['workspaces'][workspace_name]['projects'] and \
+                           task_name in motion_data['workspaces'][workspace_name]['projects'][project_name]['tasks']:
 
-            # Backfill Motion URLs into OF notes for mapped tasks missing them
-            self._backfill_missing_cross_links(motion_data)
+                            motion_data['workspaces'][workspace_name]['projects'][project_name]['tasks'][task_name]['status'] = {'name': 'Completed', 'isResolvedStatus': True}
+                            motion_data['workspaces'][workspace_name]['projects'][project_name]['tasks'][task_name]['updatedTime'] = datetime.now(timezone.utc).isoformat()
+                    else:
+                        stats['failed'] += 1
 
-            self.save_motion_data_to_file(motion_data, update_timestamp=True)
-            logger.info("✅ Sync plan execution completed")
-            return True
+            if not dry:
+                self._backfill_missing_cross_links(motion_data)
+                self.save_motion_data_to_file(motion_data, update_timestamp=True)
+
+            logger.info(f"\n📊 Forward Sync Results:")
+            logger.info(f"   📁 Projects created: {stats['projects_created']}")
+            logger.info(f"   ➕ Tasks created: {stats['tasks_created']}")
+            logger.info(f"   ↪️  Tasks updated: {stats['tasks_updated']}")
+            logger.info(f"   ✅ Tasks completed: {stats['tasks_completed']}")
+            if stats['failed'] > 0:
+                logger.error(f"   ❌ Failed: {stats['failed']}")
+
+            return stats
         except Exception as e:
             logger.error(f"❌ Error executing sync plan: {e}")
             logger.debug(traceback.format_exc())
-            return False
+            stats['failed'] += 1
+            return stats
 
     def _create_task(self, name: str, project_id: str, task_data: Dict, motion_data: Dict, motion_workspace_name: str) -> Optional[Dict]:
         """Create a task in Motion and return the full task object."""
@@ -1816,7 +1974,8 @@ class MotionHybridSync:
             schedule_name_to_use=schedule_name,
             priority=motion_priority,
             labels=task_data.get('contexts', []),
-            default_due_date_offset=self.config.default_due_date_offset_days
+            default_due_date_offset=self.config.default_due_date_offset_days,
+            sequence_info=task_data.get('sequence_info')
         )
         return result if result and result.get('id') else None
 
@@ -1835,7 +1994,7 @@ class MotionHybridSync:
         Runs during normal sync to ensure all mapped tasks have cross-links,
         not just newly created ones.
         """
-        if not self.id_mapper:
+        if self.dry_run or not self.id_mapper:
             return
 
         mappings = self.id_mapper.state_data.get('task_mappings', {})
@@ -1944,6 +2103,67 @@ class MotionHybridSync:
 
         logger.info(f"🔗 Cross-link backfill complete: {motion_updated} Motion tasks, {of_updated} OF tasks updated")
 
+    def prune_stale_mappings(self, motion_data: Dict):
+        """Remove mappings where both OF and Motion tasks no longer exist.
+
+        Conservative: keeps mappings where only one side is deleted, since
+        reverse sync may still need them.
+        """
+        if not self.id_mapper:
+            return
+
+        mappings = self.id_mapper.state_data.get('task_mappings', {})
+        if not mappings:
+            return
+
+        # Guard: if OF structure wasn't loaded (None), we can't reliably determine
+        # which OF tasks still exist — skip to avoid false positives.
+        # Note: [] (loaded but empty) is a valid state and should proceed.
+        if self.of_structure is None:
+            logger.debug("⏭️  Skipping stale mapping cleanup — OmniFocus structure not loaded")
+            return
+
+        # Build set of known OF task IDs
+        of_task_ids = set()
+        if self.of_structure:
+            for folder in self.of_structure:
+                for project in folder.projects:
+                    for task in project.tasks:
+                        of_task_ids.add(task.id)
+
+        # Build set of known Motion task IDs from local data
+        motion_task_ids = set()
+        for ws_data in motion_data.get('workspaces', {}).values():
+            for proj_data in ws_data.get('projects', {}).values():
+                for task_data in proj_data.get('tasks', {}).values():
+                    if task_data.get('id'):
+                        motion_task_ids.add(task_data['id'])
+
+        # Find mappings where BOTH sides are gone
+        keys_to_remove = []
+        for key, mapping in mappings.items():
+            of_id = mapping.get('of_id')
+            motion_id = mapping.get('motion_id')
+            of_gone = of_id and of_id not in of_task_ids
+            motion_gone = motion_id and motion_id not in motion_task_ids
+            if of_gone and motion_gone:
+                keys_to_remove.append(key)
+
+        if not keys_to_remove:
+            return
+
+        if self.dry_run:
+            logger.info(f"[DRY RUN] Would prune {len(keys_to_remove)} stale mapping(s)")
+            return
+
+        for key in keys_to_remove:
+            del mappings[key]
+        self.id_mapper._rebuild_indexes()
+        logger.info(f"🧹 Pruned {len(keys_to_remove)} stale mapping(s) (both OF and Motion tasks deleted)")
+
+        # Persist the pruned state to disk
+        self.save_motion_data_to_file(self.id_mapper.state_data, update_timestamp=False)
+
     def log_workspace_schedule_info(self):
         """Log workspace schedule mapping for reference."""
         logger.debug(" M-> Workspace Schedule Mapping (for reference):")
@@ -1968,13 +2188,14 @@ class MotionHybridSync:
         
         logger.info("✅ Workflow completed successfully!")
     
-    def run_bidirectional_sync(self, refresh_mapping: bool = False):
+    def run_bidirectional_sync(self, refresh_mapping: bool = False, run_id: str = ""):
         """
         Execute full bidirectional synchronization.
         Loads OmniFocus structure once and shares it across all phases.
         Phase 1: OmniFocus → Motion
         Phase 2: Motion → OmniFocus
         """
+        start_time = time.monotonic()
         logger.info("🚀 OmniFocus ↔ Motion Bidirectional Sync")
         logger.info("=" * 50)
 
@@ -1988,23 +2209,51 @@ class MotionHybridSync:
             logger.error("❌ Failed to load OmniFocus structure. Cannot proceed.")
             return
 
-        if refresh_mapping:
+        if refresh_mapping and not self.dry_run:
             logger.info("\n" + "=" * 50)
             logger.info("Phase 0: Backfill Cross-Links")
             logger.info("=" * 50)
             self.backfill_cross_links()
+        elif refresh_mapping and self.dry_run:
+            logger.info("\n[DRY RUN] Would backfill cross-links")
 
         self.log_workspace_schedule_info()
 
         logger.info("\n" + "=" * 50)
         logger.info("Phase 1: OmniFocus → Motion")
         logger.info("=" * 50)
-        self.sync_omnifocus_to_motion()
+        forward_stats = self.sync_omnifocus_to_motion()
 
         logger.info("\n" + "=" * 50)
         logger.info("Phase 2: Motion → OmniFocus")
         logger.info("=" * 50)
-        self.sync_motion_to_omnifocus()
+        reverse_stats = self.sync_motion_to_omnifocus()
+
+        # Prune stale mappings (after both sync directions have run)
+        # Load state data directly to avoid load_motion_data_from_file() which
+        # would create a new id_mapper and discard in-memory mappings
+        motion_data = self.state_manager.load()
+        self.prune_stale_mappings(motion_data)
+
+        duration = time.monotonic() - start_time
+
+        # Aggregated summary
+        logger.info("\n" + "=" * 50)
+        logger.info("Sync Summary")
+        logger.info("=" * 50)
+        logger.info(f"  OF → Motion:  {forward_stats.get('tasks_created', 0)} created, "
+                     f"{forward_stats.get('tasks_updated', 0)} updated, "
+                     f"{forward_stats.get('tasks_completed', 0)} completed, "
+                     f"{forward_stats.get('failed', 0)} failed")
+        logger.info(f"  Motion → OF:  {reverse_stats.get('tasks_created', 0)} created, "
+                     f"{reverse_stats.get('tasks_completed', 0)} completed, "
+                     f"{reverse_stats.get('failed', 0)} failed")
+        logger.info(f"  Duration:     {duration:.1f}s")
+
+        # Persist sync history
+        append_sync_history(run_id=run_id, duration_seconds=duration,
+                            dry_run=self.dry_run,
+                            forward_stats=forward_stats, reverse_stats=reverse_stats)
 
         logger.info("\n✅ Bidirectional sync completed successfully!")
 
@@ -2014,6 +2263,7 @@ def main():
     parser.add_argument("--refresh-mapping", action="store_true", help="Force refresh of Motion data mapping and then sync")
     parser.add_argument("--sync-only", action="store_true", help="Only run sync, skip mapping creation (uses existing local data)")
     parser.add_argument("--mapping-only", action="store_true", help="Only create/refresh the local mapping file, skip sync")
+    parser.add_argument("--dry-run", action="store_true", help="Preview changes without making any mutations")
     parser.add_argument("--config", type=str, default="config.json", help="Path to configuration file (default: config.json)")
 
     args = parser.parse_args()
@@ -2042,8 +2292,11 @@ def main():
             logger.error("❌ No API key provided. Exiting.")
             return
     
+    if args.dry_run:
+        logger.info("🔍 DRY RUN MODE — no changes will be made")
+
     MotionSync.set_api_key(api_key)
-    sync = MotionHybridSync(api_key, config)
+    sync = MotionHybridSync(api_key, config, dry_run=args.dry_run)
     
     try:
         if args.mapping_only:
@@ -2053,7 +2306,7 @@ def main():
             logger.info("🔄 Running sync only...")
             sync.sync_omnifocus_to_motion()
         else:
-            sync.run_bidirectional_sync(refresh_mapping=args.refresh_mapping)
+            sync.run_bidirectional_sync(refresh_mapping=args.refresh_mapping, run_id=run_id)
             
     except KeyboardInterrupt:
         logger.info("\n⏹️ Process interrupted by user")

@@ -6,13 +6,15 @@ venv/
 # Personal config (use config.example.json as template)
 config.json
 
-# Personal LaunchAgent (use com.yourusername.omnifocus-motion-sync.example.plist as template)
+# Personal LaunchAgents (use .example.plist files as templates)
 com.yourusername.omnifocus-motion-sync.plist
+com.yourusername.omnifocus-motion-healthcheck.plist
 
 # State files
 motion_hierarchical_mapping.json
 motion_hierarchical_mapping.json.backup
 motion_hierarchical_mapping.json.sha256
+sync_history.jsonl
 
 # Xcode project
 motion-sync.xcodeproj/
@@ -20,5 +22,5 @@ motion-sync.xcodeproj/
 # OS files
 .DS_Store
 
-# This file (local only)
-.gitignore
+# Lock file
+/tmp/of2motion.lock
