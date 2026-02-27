@@ -1,0 +1,16 @@
+{
+  "workspace_mapping": {
+    "Your OmniFocus Folder": "Your Motion Workspace"
+  },
+  "workspace_schedules": {
+    "Your Motion Workspace": "Anytime (24/7)"
+  },
+  "ignored_folders": [
+    "Routines",
+    "Reference"
+  ],
+  "sync_settings": {
+    "api_rate_limit_delay": 0.2,
+    "workspace_processing_delay": 0.5
+  }
+}

@@ -1,80 +1,266 @@
-# OmniFocus to Motion Sync Script
+# OmniFocus to Motion Sync
 
-**`sync_of_to_motion.py`**  
-Synchronize tasks and projects from **OmniFocus** to **Motion** with optional autoscheduling, due dates, priorities, and smart matching.
+Bidirectional synchronization between OmniFocus and Motion task management systems.
 
-## 🚀 Overview
+## 🚀 Quick Setup
 
-This script bridges OmniFocus and Motion to keep your tasks aligned across platforms. It supports syncing folders, projects, and tasks with detailed conditions, handling task creation and deletion intelligently. You can run in `dry_run` mode to preview actions without changes, or fully synchronize in `sync` mode.
+### 1. Install Dependencies
 
-## 🔧 Features
+```bash
+./setup.sh
+```
 
-- Fetches folders, projects, and tasks from OmniFocus.
-- Matches them to corresponding workspaces and projects in Motion.
-- Adds new tasks from OmniFocus to Motion, respecting due dates, durations, and flags.
-- Deletes completed tasks in Motion if marked complete in OmniFocus.
-- Maps workspaces to Motion schedules using `WORKSPACE_TO_SCHEDULE_MAP`.
-- Supports different sync modes: `dry_run`, `sync`, and `strict`.
-- Respects Motion API rate limits (12 req/min).
+Or manually:
 
-## 🛠️ Requirements
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
 
-- macOS with OmniFocus installed and running
-- Python 3.7+
-- Motion API Key (get it from your Motion account)
-- Internet connection (for Motion API access)
+### 2. Configure API Key
 
-## 🔐 Environment Variables
+Add to `~/.zshrc` or `~/.bash_profile`:
 
-- `MOTION_API_KEY` — *(required)* your Motion API key.
-- `OMNIFOCUS_SYNC_MODE` — *(optional)* one of:
-  - `dry_run` (default): simulate sync without changes
-  - `sync`: perform synchronization
-  - `strict`: like `sync`, but only exact name matches are used
-- `OMNIFOCUS_SKIP_FOLDERS` — *(optional)* comma-separated names of OmniFocus folders to skip.
+```bash
+export MOTION_API_KEY='your_api_key_here'
+```
 
-## 📅 Workspace → Schedule Mapping
+Then reload:
 
-Update the following dict to map workspaces to Motion schedule names:
+```bash
+source ~/.zshrc
+```
 
-```python
-WORKSPACE_TO_SCHEDULE_MAP = {
-    "🏠 Home": "Personal hours",
-    "Work": "Work horus",
+### 3. Generate Configuration
+
+Create your `config.json` file with workspace mappings:
+
+```bash
+source venv/bin/activate
+python3 setup_config.py
+```
+
+This will:
+- Fetch your Motion workspaces
+- Create workspace mappings automatically
+- Set up default schedules
+- Save to `config.json`
+
+Or copy the example and edit manually:
+
+```bash
+cp config.example.json config.json
+```
+
+See `config.example.json` for the template and the [Configuration](#-configuration) section below for details.
+
+### 4. Run Initial Sync
+
+```bash
+source venv/bin/activate
+python3 sync_of_to_motion.py --refresh-mapping
+```
+
+## 📋 Command Line Options
+
+- `--sync-only` - Only run sync (uses existing local cache)
+- `--refresh-mapping` - Force refresh Motion data mapping, then sync
+- `--mapping-only` - Only create/refresh the local mapping file, skip sync
+- `--config <file>` - Use custom config file (default: config.json)
+
+## 🔧 Configuration
+
+### Workspace Mapping
+
+Maps OmniFocus folder names to Motion workspace names:
+
+```json
+{
+  "workspace_mapping": {
+    "OmniFocus Folder Name": "Motion Workspace Name"
+  }
 }
 ```
 
-## ▶️ Usage
-
-```bash
-# Dry run (default)
-python3 sync_of_to_motion.py
-
-# Full sync (creates/deletes items)
-OMNIFOCUS_SYNC_MODE=sync python3 sync_of_to_motion.py
-
-# Strict sync (exact name matches only)
-OMNIFOCUS_SYNC_MODE=strict python3 sync_of_to_motion.py
+If names match exactly, use identity mapping:
+```json
+{
+  "workspace_mapping": {
+    "My Workspace": "My Workspace"
+  }
+}
 ```
 
-## 💾 Sync State Tracking
+### Workspace Schedules
 
-The script saves the last successful sync time to `sync_of_motion_state.json`. Only new or modified OmniFocus items are processed unless no state file exists.
+Motion's auto-scheduling feature uses these:
 
-## 📈 Logging
+```json
+{
+  "workspace_schedules": {
+    "Personal": "Personal hours",
+    "Work": "Work hours"
+  }
+}
+```
 
-The script prints detailed status updates, including:
-- Items created, deleted, or skipped
-- API rate limiting status
-- Schedule mapping and errors
+### Ignored Folders
 
-## ⚠️ Notes
+OmniFocus folders to exclude from sync:
 
-- Ensure OmniFocus is open when running the script.
-- This script does **not** sync data from Motion back to OmniFocus.
-- Deleted Motion tasks are based on completed OmniFocus tasks only.
+```json
+{
+  "ignored_folders": ["Routines", "Reference", "Archive"]
+}
+```
 
-## 📂 File Structure
+### Validate Config
 
-- `sync_of_to_motion.py` – main synchronization script
-- `sync_of_motion_state.json` – state file for tracking last sync time (auto-generated)
+```bash
+python3 setup_config.py validate
+```
+
+## 🔄 Automated Sync (LaunchAgent)
+
+### Install LaunchAgent:
+
+```bash
+# Create log directory
+mkdir -p ~/Library/Logs/OmniFocusMotionSync
+
+# Copy example plist and update paths + API key
+cp com.yourusername.omnifocus-motion-sync.example.plist ~/Library/LaunchAgents/com.yourusername.omnifocus-motion-sync.plist
+
+# Load the agent
+launchctl load ~/Library/LaunchAgents/com.yourusername.omnifocus-motion-sync.plist
+```
+
+### Check Status:
+
+```bash
+# Check if it's running
+launchctl list | grep omnifocus
+
+# View logs
+tail -f ~/Library/Logs/OmniFocusMotionSync/sync.log
+```
+
+### Unload LaunchAgent:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.yourusername.omnifocus-motion-sync.plist
+```
+
+## 📁 Files
+
+- `sync_of_to_motion.py` - Main sync script
+- `config.example.json` - Example configuration (copy to `config.json`)
+- `com.yourusername.omnifocus-motion-sync.example.plist` - Example LaunchAgent
+- `setup_config.py` - Interactive config generator
+- `list_motion_workspaces.py` - List your Motion workspaces
+- `requirements.txt` - Python dependencies
+- `setup.sh` - Setup script
+
+## 🐛 Troubleshooting
+
+### Script Won't Run
+
+Make sure virtual environment is activated:
+
+```bash
+source venv/bin/activate
+```
+
+### Lock File Issues
+
+If script says "another instance is running" but it's not:
+
+```bash
+rm /tmp/of2motion.lock
+```
+
+### Config Not Loading
+
+Validate your config:
+
+```bash
+python3 setup_config.py validate
+```
+
+### Workspace Not Found
+
+Run this to see your actual Motion workspaces:
+
+```bash
+python3 list_motion_workspaces.py
+```
+
+Then update `config.json` with the correct names.
+
+### Check Logs
+
+```bash
+tail -n 50 ~/Library/Logs/OmniFocusMotionSync/sync.log
+```
+
+## 📊 Current Features (Sprint 1 Complete ✅)
+
+- ✅ One-way sync: OmniFocus → Motion
+- ✅ Create projects and tasks in Motion
+- ✅ Update Motion tasks when OmniFocus changes
+- ✅ Mark Motion tasks complete when done in OmniFocus
+- ✅ Bidirectional ID mapping infrastructure
+- ✅ File locking (prevents concurrent runs)
+- ✅ Comprehensive error handling
+- ✅ External configuration file (JSON)
+- ✅ Configurable workspace mappings
+- ✅ Configurable ignored folders
+
+## 🚧 Coming Soon (Sprint 2)
+
+- ⏳ Bidirectional sync: Motion → OmniFocus
+- ⏳ Complete OmniFocus tasks when done in Motion
+- ⏳ Conflict resolution
+- ⏳ Sequential project handling
+
+## 📝 Configuration Examples
+
+### Multiple Workspaces
+
+```json
+{
+  "workspace_mapping": {
+    "OF Folder A": "Motion Workspace 1",
+    "OF Folder B": "Motion Workspace 1",
+    "OF Folder C": "Motion Workspace 2",
+    "Side Projects": "Freelance"
+  }
+}
+```
+
+### Custom Schedules
+
+```json
+{
+  "workspace_schedules": {
+    "Work": "Work hours",
+    "Personal": "Personal hours",
+    "Freelance": "Anytime (24/7)",
+    "Errands": "Weekend only"
+  }
+}
+```
+
+### Adjust Rate Limits
+
+If you're hitting API limits, increase delays:
+
+```json
+{
+  "sync_settings": {
+    "api_rate_limit_delay": 0.5,
+    "workspace_processing_delay": 1.0
+  }
+}
+```

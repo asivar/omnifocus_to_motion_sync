@@ -1,828 +1,1765 @@
 #!/usr/bin/env python3
 """
-sync_of_to_motion.py — Synchronize OmniFocus folders/projects/tasks to Motion
+OmniFocus to Motion Sync Script
+Version: 3.1 - Stable
 
-Core Synchronization Logic:
-1. Retrieve structures (folders, projects with URL & mod_date, tasks with URL, Due Date, Duration, Flagged status, mod_date, completed status) from OmniFocus.
-2. Retrieve structures (workspaces, projects, tasks with status, schedule names) from Motion.
-3. Match workspaces/folders. Skips OmniFocus folders named "Reference" or "Routines".
-4. Synchronize projects between matched workspaces.
-   - Adds OmniFocus project URL to the Motion project description.
-   - Only processes OF projects new or modified since last successful sync (or if they contain new/modified tasks).
-5. Synchronize tasks:
-   - If OF task is recently modified & completed, and exists in Motion: DELETE Motion task.
-   - Else if OF task is not completed and is new/modified in OF and not in Motion: CREATE Motion task.
-     - Adds OF task URL to Motion task description.
-     - Sets Due Date and Duration.
-     - Sets Motion task priority based on OF flag.
-     - Assigns Motion schedule using schedule NAME via autoScheduled.schedule field.
-   - Infers projectId and workspaceId for tasks if missing from API response.
-6. Optionally create missing workspaces or projects based on SYNC_MODE.
-7. Respects Motion API rate limits (12 requests/minute) and handles 429 errors more gracefully.
-8. Provide detailed sync report.
+This script combines:
+1. Motion data mapping creation
+2. OmniFocus to Motion synchronization
+3. Local JSON-based comparison
+4. Automatic data updates
 
-Environment Variables:
-- MOTION_API_KEY: Required Motion API key.
-- OMNIFOCUS_SYNC_MODE: Optional sync mode (default: 'dry_run').
-    - 'dry_run': Report differences without making changes.
-    - 'sync': Create missing items (OF -> Motion); Delete Motion tasks for completed OF tasks.
-    - 'strict': Only sync exact name matches; Task/Project link/schedule/deletion sync follows 'sync' logic.
-- OMNIFOCUS_SKIP_FOLDERS: Comma-separated list of OF folder names to skip.
-
-Usage:
-```bash
-python3 sync_of_to_motion.py
-OMNIFOCUS_SYNC_MODE=sync python3 sync_of_to_motion.py
-```
+Usage: python3 sync_of_to_motion_hybrid.py [--refresh-mapping] [--sync-only]
 """
-from __future__ import annotations
 
-import json
 import os
-import subprocess
 import sys
+import json
 import time
-import traceback
-import datetime
-from collections import deque
-from typing import Dict, List, Set, Optional, Any
+import re
+import argparse
+import subprocess
+import fcntl  # Added for file locking
+import traceback  # For error stack traces
+import atexit  # For cleanup on exit
+import requests  # For HTTP API calls
+from typing import Dict, List, Optional, Union, Any
+from datetime import datetime, timedelta, timezone
 
-import requests
-from dataclasses import dataclass, field
+# --- Global Configuration ---
+LOCK_FILE = "/tmp/of2motion.lock"
+DEFAULT_CONFIG_FILE = "config.json"
+METADATA_SEPARATOR = "═" * 40
 
-# --- Configuration and API Setup ---
-MOTION_API_KEY = os.getenv("MOTION_API_KEY")
-SYNC_MODE = os.getenv("OMNIFOCUS_SYNC_MODE", "dry_run").lower()
-DEFAULT_SKIP_FOLDERS = "Reference,Routines"
-SKIP_FOLDERS_STR = os.getenv("OMNIFOCUS_SKIP_FOLDERS", DEFAULT_SKIP_FOLDERS)
-SKIP_FOLDERS: Set[str] = {name.strip() for name in SKIP_FOLDERS_STR.split(',') if name.strip()}
 
-WORKSPACE_TO_SCHEDULE_MAP: Dict[str, str] = {
-    "OMNIFOCUS FOLDER 1": "Motion Calendar Name 1", "OMNIFOCUS FOLDER 2": "Motion Calendar Name 2",
-}
+def build_description(body: str = "", tags: Optional[List[str]] = None,
+                      of_url: Optional[str] = None, motion_url: Optional[str] = None) -> str:
+    """Build a standardized description/note with metadata below a separator."""
+    parts = []
+    if body:
+        parts.append(body.strip())
 
-BASE_URL = "https://api.usemotion.com/v1"
-REQUEST_TIMEOUT = 30
-RATE_LIMIT_REQUESTS = 12
-RATE_LIMIT_WINDOW = 60
-STATE_FILE = "sync_of_motion_state.json"
+    metadata = []
+    if tags:
+        metadata.append("Tags: " + ", ".join(tags))
+    if of_url:
+        metadata.append(of_url)
+    if motion_url:
+        metadata.append(motion_url)
 
-if not MOTION_API_KEY:
-    sys.exit("❌ Error: MOTION_API_KEY environment variable is not set.")
+    if metadata:
+        parts.append(METADATA_SEPARATOR + "\n")
+        parts.append("\n".join(metadata))
 
-HEADERS = {
-    "Accept": "application/json", "X-API-Key": MOTION_API_KEY,
-    "Content-Type": "application/json",
-}
+    return "\n\n".join(parts)
+
+
+def extract_body(text: str) -> str:
+    """Extract just the body content from a description/note (everything above the separator)."""
+    if not text:
+        return ""
+    if METADATA_SEPARATOR in text:
+        return text.split(METADATA_SEPARATOR)[0].strip()
+    return text.strip()
+
+
+def strip_html(text: str) -> str:
+    """Strip HTML tags from text, converting <br> and </p> to newlines."""
+    if not text or '<' not in text:
+        return text or ""
+    text = re.sub(r'<br\s*/?>', '\n', text)
+    text = re.sub(r'</p>\s*<p>', '\n\n', text)
+    text = re.sub(r'<[^>]+>', '', text)
+    return text.strip()
+
+class Config:
+    """Configuration manager for OmniFocus to Motion sync."""
+    
+    def __init__(self, config_file: str = DEFAULT_CONFIG_FILE):
+        self.config_file = config_file
+        self.config = self._load_config()
+    
+    def _load_config(self) -> Dict:
+        """Load configuration from JSON file with fallback to defaults."""
+        if os.path.exists(self.config_file):
+            try:
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    config_data = json.load(f)
+                print(f"✅ Loaded configuration from {self.config_file}")
+                return config_data
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"⚠️  Error reading config file: {e}. Using defaults.")
+        else:
+            print(f"⚠️  Config file '{self.config_file}' not found. Using defaults.")
+        
+        # Default configuration
+        return {
+            "workspace_mapping": {},
+            "workspace_schedules": {
+                "My Private Workspace": "Anytime (24/7)"
+            },
+            "ignored_folders": ["Routines", "Reference"],
+            "sync_settings": {
+                "api_rate_limit_delay": 0.2,
+                "workspace_processing_delay": 0.5
+            }
+        }
+    
+    def save_config(self) -> bool:
+        """Save current configuration to file."""
+        try:
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump(self.config, f, indent=2, ensure_ascii=False)
+            print(f"✅ Configuration saved to {self.config_file}")
+            return True
+        except IOError as e:
+            print(f"❌ Error saving config: {e}")
+            return False
+    
+    @property
+    def workspace_mapping(self) -> Dict[str, str]:
+        """Get OmniFocus folder to Motion workspace mapping."""
+        return self.config.get("workspace_mapping", {})
+    
+    @property
+    def workspace_schedules(self) -> Dict[str, str]:
+        """Get Motion workspace to schedule mapping."""
+        return self.config.get("workspace_schedules", {})
+    
+    @property
+    def ignored_folders(self) -> List[str]:
+        """Get list of OmniFocus folders to ignore."""
+        return self.config.get("ignored_folders", [])
+    
+    @property
+    def api_rate_limit_delay(self) -> float:
+        """Delay between API requests (seconds)."""
+        return self.config.get("sync_settings", {}).get("api_rate_limit_delay", 0.2)
+    
+    @property
+    def workspace_processing_delay(self) -> float:
+        """Delay between processing workspaces (seconds)."""
+        return self.config.get("sync_settings", {}).get("workspace_processing_delay", 0.5)
+
+def acquire_lock():
+    """Ensures only one instance of the script runs at a time."""
+    # We use a persistent handle so the lock stays active for the script's life
+    fp = open(LOCK_FILE, 'w')
+    try:
+        # LOCK_EX: Exclusive lock
+        # LOCK_NB: Non-blocking (fail immediately if locked)
+        fcntl.lockf(fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        
+        # Ensure lock is released on exit
+        atexit.register(lambda: (fp.close(), os.remove(LOCK_FILE) if os.path.exists(LOCK_FILE) else None))
+        
+        return fp
+    except IOError:
+        fp.close()  # Close file handle if lock fails
+        print("⛔ Another instance is already running. Exiting to prevent API conflicts.")
+        sys.exit(0)
 
 # --- Data Classes ---
-@dataclass
-class MotionTask:
-    id: str; name: str; projectId: str; workspaceId: str
-    description: Optional[str] = None; dueDate: Optional[str] = None
-    duration: Optional[int] = None; schedule: Optional[str] = None
-    priority: Optional[str] = None
-    # status_id, status_type, status_name are no longer strictly needed if we delete on completion
-    # but keeping them doesn't hurt if get_tasks_in_project populates them for other potential uses/logging.
-
-@dataclass
 class OFTask:
-    id: str; name: str
-    note: Optional[str] = None; completed: bool = False
-    url: Optional[str] = None; due_date: Optional[str] = None
-    duration_minutes: Optional[int] = None
-    flagged: bool = False
-    of_modification_date: Optional[str] = None
+    """OmniFocus task data structure."""
+    def __init__(self, id, name, note="", due_date=None, defer_date=None, duration_minutes=None, 
+                 completed=False, url=None, flagged=False, of_modification_date=None, 
+                 contexts=None, repeat_rule=None, of_priority=None):
+        self.id = id
+        self.name = name
+        self.note = note
+        self.due_date = due_date
+        self.defer_date = defer_date  # ✅ NEW: Start date
+        self.duration_minutes = duration_minutes
+        self.completed = completed
+        self.url = url
+        self.flagged = flagged
+        self.of_modification_date = of_modification_date
+        self.contexts = contexts or []  # ✅ NEW: Tags/contexts
+        self.repeat_rule = repeat_rule  # ✅ NEW: Recurring task rule
+        self.of_priority = of_priority  # ✅ NEW: Explicit priority (high/medium/low)
 
-@dataclass
 class OFProject:
-    id: str; name: str
-    url: Optional[str] = None
-    of_modification_date: Optional[str] = None
-    tasks: List[OFTask] = field(default_factory=list)
+    """OmniFocus project data structure."""
+    def __init__(self, id, name, url=None, of_modification_date=None, completed=False, tasks=None):
+        self.id = id
+        self.name = name
+        self.url = url
+        self.of_modification_date = of_modification_date
+        self.completed = completed
+        self.tasks = tasks or []
 
-@dataclass
 class OFFolder:
-    id: str; name: str
-    projects: List[OFProject] = field(default_factory=list)
+    """OmniFocus folder data structure."""
+    def __init__(self, id, name, projects=None):
+        self.id = id
+        self.name = name
+        self.projects = projects or []
 
-@dataclass
-class SyncConfig:
-    create_missing_workspaces: bool = False; create_missing_projects: bool = False
-    create_missing_tasks: bool = False; strict_matching: bool = False
-    skip_folders: Set[str] = field(default_factory=set)
-
-# --- Motion API Interaction ---
+# --- Motion API Interaction Class ---
 class MotionSync:
-    _request_timestamps: deque = deque()
+    """Handles all Motion API operations with proper error handling and rate limiting."""
+
+    _api_key: Optional[str] = None
+    MAX_RETRIES = 3
 
     @classmethod
-    def _enforce_rate_limit(cls):
-        now = time.monotonic()
-        while cls._request_timestamps and cls._request_timestamps[0] <= now - RATE_LIMIT_WINDOW:
-            cls._request_timestamps.popleft()
-        if len(cls._request_timestamps) >= RATE_LIMIT_REQUESTS:
-            wait_time = (cls._request_timestamps[0] + RATE_LIMIT_WINDOW) - now
-            if wait_time > 0:
-                print(f"⏳ Rate limit ({RATE_LIMIT_REQUESTS}/{RATE_LIMIT_WINDOW}s) reached. Waiting for {wait_time:.2f} seconds...")
-                time.sleep(wait_time)
-            now = time.monotonic()
-            while cls._request_timestamps and cls._request_timestamps[0] <= now - RATE_LIMIT_WINDOW:
-                 cls._request_timestamps.popleft()
-        cls._request_timestamps.append(now)
+    def set_api_key(cls, api_key: str):
+        """Set the API key for all Motion API requests."""
+        cls._api_key = api_key
 
     @classmethod
-    def _make_request(cls, method: str, endpoint: str, params: Optional[Dict] = None, json_data: Optional[Dict] = None) -> Any:
-        cls._enforce_rate_limit()
-        url = f"{BASE_URL}/{endpoint}"
-        request_details = f"({method} {url} | Params: {params} | Body: {json_data})"
-        response_obj = None
-        try:
-            response_obj = requests.request(method, url, headers=HEADERS, params=params, json=json_data, timeout=REQUEST_TIMEOUT)
-            
-            if response_obj.status_code == 429:
-                print(f"⏳ Received 429 Rate Limit from API @ {url}. Waiting for {RATE_LIMIT_WINDOW}s and will skip this attempt.")
-                time.sleep(RATE_LIMIT_WINDOW)
-                return None
-            elif response_obj.status_code == 401:
-                print(f"❌ Auth Error ({response_obj.status_code}) @ {url}. Check API Key.")
-            elif response_obj.status_code == 400:
-                print(f"❌ Bad Request ({response_obj.status_code}) @ {url}.")
-                try: print(f"   API Error: {response_obj.json()}")
-                except json.JSONDecodeError: print(f"   API Response (non-JSON): {response_obj.text}")
-            
-            response_obj.raise_for_status()
-            
-            if response_obj.status_code == 204: return None # Typical for successful DELETE
-            if response_obj.text:
-                try: return response_obj.json()
-                except json.JSONDecodeError:
-                    print(f" M-> Warn: Non-JSON response {method} {url}. Status: {response_obj.status_code}, Body: {response_obj.text[:200]}...")
-                    return None
-            return None
+    def _make_request(cls, method: str, endpoint: str, json_data: Optional[Dict] = None,
+                      params: Optional[Dict] = None, _retry_count: int = 0) -> Optional[Dict]:
+        """Make HTTP request to Motion API with proper error handling."""
+        url = f"https://api.usemotion.com/v1/{endpoint}"
+        headers = {
+            "X-API-Key": cls._api_key or os.getenv("MOTION_API_KEY"),
+            "Content-Type": "application/json"
+        }
         
-        except requests.exceptions.HTTPError as e:
-            print(f"🚨 HTTP Error during {request_details}: {e}")
-            if hasattr(e, 'response') and e.response is not None and e.response.status_code == 429:
-                print(f"   Caught HTTPError 429 for {url} in except block. This should have been handled earlier by explicit check. Returning None.")
-                return None
-            else:
-                raise
-        except requests.exceptions.RequestException as e:
-            print(f"🚨 Network/Request Error {request_details}: {e}")
-            raise
-
-    @classmethod
-    def get_workspaces(cls) -> Dict[str, Dict]:
-        print(" M-> Fetching Motion workspaces...");
         try:
-            data = cls._make_request("GET", "workspaces")
-            ws = data.get("workspaces", []) if data else []; print(f" M-> Found {len(ws)} workspaces.")
-            return {w.get("name"): w for w in ws if w.get("name")}
-        except Exception as e:
-            print(f"🚨 Failed to get Motion workspaces: {e}"); return {}
-
-    @classmethod
-    def get_projects_in_workspace(cls, workspace_id: str) -> Dict[str, Dict]:
-        try:
-            data = cls._make_request("GET", "projects", params={"workspaceId": workspace_id})
-            proj = data.get("projects", []) if data else []
-            return {p.get("name"): p for p in proj if p.get("name")}
-        except Exception as e:
-            print(f"🚨 Failed to get projects for workspace {workspace_id}: {e}"); return {}
-
-
-    @classmethod
-    def get_schedules(cls) -> Set[str]:
-        print(" M-> Fetching Motion schedules..."); found_schedule_names: Set[str] = set()
-        try:
-            data = cls._make_request("GET", "schedules")
-            print(f"   M-> Raw schedule data from API (first 500 chars): {str(data)[:500]}...")
-            schedules_list = []
-            if isinstance(data, list): schedules_list = data
-            elif isinstance(data, dict) and "schedules" in data: schedules_list = data.get("schedules", [])
-            elif data is not None: print(f" M-> Warn: Unexpected data format for schedules: {type(data)}.")
-            if not schedules_list and data is not None:
-                 print(f" M-> Info: No schedules extracted from API response. Raw data was: {str(data)[:500]}...")
-            for s_item in schedules_list:
-                if isinstance(s_item, dict):
-                    name = s_item.get("name")
-                    api_id = s_item.get("id")
-                    if name:
-                        found_schedule_names.add(name)
-                        id_info = f"(API ID: {api_id})" if api_id else "(API ID: not provided by API)"
-                        print(f"     ✅ Schedule Found: '{name}' {id_info}")
-                    else:
-                        print(f"     ⚠️ Skipping schedule item due to missing name: {str(s_item)[:200]}")
-                else: print(f" M-> Warn: Skipping invalid schedule item (not a dict): {str(s_item)[:200]}")
-            print(f" M-> Found {len(found_schedule_names)} unique schedule names from API.")
-            if not found_schedule_names and schedules_list:
-                 print(" M-> Critical Warn: API returned schedule items, but NONE had a usable name.")
-            return found_schedule_names
-        except Exception as e: print(f"🚨 Failed to get or process Motion schedules: {e}"); traceback.print_exc(); return set()
-
-    # get_completed_status_id method is no longer needed for delete logic
-    # update_task_status method is no longer needed for delete logic
-
-    @classmethod
-    def get_tasks_in_project(cls, project_id_context: str, workspace_id_context: str) -> Dict[str, MotionTask]:
-        tasks_dict = {}; next_cursor = None; page_count = 0; max_pages = 50
-        first_page_api_returned_none = False
-        first_page_api_returned_direct_empty_list = False
-        first_page_api_returned_nested_empty_list = False
-        first_page_api_had_malformed_tasks_key = False
-        first_page_api_had_unparsable_tasks = False
-
-        try:
-            while page_count < max_pages:
-                page_count += 1; params = {"projectId": project_id_context}
-                if next_cursor: params["cursor"] = next_cursor
-                
-                print(f"   M-> API Call: GET /tasks for project {project_id_context}, page {page_count}{' with cursor' if next_cursor else ''}")
-                data = cls._make_request("GET", "tasks", params=params)
-                
-                if data is None:
-                    if page_count == 1: first_page_api_returned_none = True
-                    break
-                
-                tasks_data_raw = None
-                is_direct_list = False
-
-                if isinstance(data, list):
-                    tasks_data_raw = data
-                    is_direct_list = True
-                    if page_count == 1:
-                        print(f"   M-> Info (Project: {project_id_context}, Page 1): API returned a direct list of {len(tasks_data_raw)} item(s).")
-                        if not tasks_data_raw: first_page_api_returned_direct_empty_list = True
-                elif isinstance(data, dict):
-                    tasks_data_raw = data.get("tasks")
-                    if page_count == 1:
-                        if tasks_data_raw is None:
-                            first_page_api_had_malformed_tasks_key = True
-                            print(f"   M-> Warn (Project: {project_id_context}, Page 1): API response was a dict but missing 'tasks' key. Response keys: {list(data.keys()) if isinstance(data, dict) else 'N/A'}")
-                        elif isinstance(tasks_data_raw, list) and not tasks_data_raw:
-                            first_page_api_returned_nested_empty_list = True
-                else:
-                    if page_count == 1: print(f"   M-> Warn (Project: {project_id_context}, Page 1): API returned unexpected data type: {type(data)}. Response: {str(data)[:200]}...")
-                    tasks_data_raw = []
-
-                if not isinstance(tasks_data_raw, list):
-                    if page_count == 1 and not first_page_api_had_malformed_tasks_key and not is_direct_list:
-                         print(f"   M-> Warn (Project: {project_id_context}, Page 1): 'tasks' key was present but not a list. Type: {type(tasks_data_raw)}. Response: {str(data)[:200]}...")
-                    tasks_data_processed = []
-                else:
-                    tasks_data_processed = tasks_data_raw
-
-                if not tasks_data_processed and page_count > 1: break
-
-                parsed_tasks_on_page = 0
-                for td_index, td in enumerate(tasks_data_processed):
-                    is_parsable = True
-                    missing_keys_reason = []
-                    
-                    task_item_id = None; task_item_name = None
-                    task_item_project_id_from_task = None; task_item_workspace_id_from_task = None
-                    final_project_id = None; final_workspace_id = None
-
-                    if not isinstance(td, dict):
-                        is_parsable = False; missing_keys_reason.append("item_not_a_dict")
-                    else:
-                        task_item_id = td.get("id"); task_item_name = td.get("name")
-                        task_item_project_id_from_task = td.get("projectId")
-                        task_item_workspace_id_from_task = td.get("workspaceId")
-                        
-                        final_project_id = task_item_project_id_from_task or project_id_context
-                        final_workspace_id = task_item_workspace_id_from_task or workspace_id_context
-                        
-                        if not task_item_id: missing_keys_reason.append(f"id_missing_or_falsy (value: {task_item_id!r})")
-                        if not task_item_name: missing_keys_reason.append(f"name_missing_or_falsy (value: {task_item_name!r})")
-                        if not final_project_id: missing_keys_reason.append(f"projectId_could_not_be_determined (task_value: {task_item_project_id_from_task!r}, context: {project_id_context!r})")
-                        if not final_workspace_id: missing_keys_reason.append(f"workspaceId_could_not_be_determined (task_value: {task_item_workspace_id_from_task!r}, context: {workspace_id_context!r})")
-                        
-                        if missing_keys_reason: is_parsable = False
-
-                    if is_parsable:
-                        # No longer need to parse status_id, status_type, status_name for this feature
-                        tasks_dict[task_item_name] = MotionTask(id=task_item_id, name=task_item_name,
-                                                                projectId=final_project_id, workspaceId=final_workspace_id,
-                                                                description=td.get("description"), dueDate=td.get("dueDate"),
-                                                                duration=td.get("duration"), schedule=td.get("schedule"),
-                                                                priority=td.get("priority"))
-                        parsed_tasks_on_page +=1
-                    else:
-                        if page_count == 1: first_page_api_had_unparsable_tasks = True
-                        print(f"   M-> Warn (Project: {project_id_context}, Page {page_count}, Item {td_index}): Skipping unparsable task item. Reason(s): {', '.join(missing_keys_reason)}. Item data (first 150 chars): {str(td)[:150]}...")
-
-                if page_count == 1 and isinstance(tasks_data_raw, list) and tasks_data_raw and parsed_tasks_on_page == 0:
-                    first_page_api_had_unparsable_tasks = True
-
-                next_cursor = data.get("meta", {}).get("nextCursor") if isinstance(data, dict) else None
-                if not next_cursor: break
+            response = requests.request(method, url, headers=headers, params=params, json=json_data)
             
-            if page_count >= max_pages: print(f" M-> Warn: Max pages ({max_pages}) for tasks in project {project_id_context}.")
-
-            if not tasks_dict:
-                if first_page_api_returned_none:
-                    print(f"   M-> Final Info (Project: {project_id_context}): API returned no data (None) on first task page. Project might be empty or an API issue occurred (check _make_request logs).")
-                elif first_page_api_returned_direct_empty_list:
-                    print(f"   M-> Final Info (Project: {project_id_context}): API returned a direct empty list on first page. Motion project is confirmed empty.")
-                elif first_page_api_returned_nested_empty_list:
-                    print(f"   M-> Final Info (Project: {project_id_context}): API returned an empty task list (tasks: []) on first page. Motion project is confirmed empty or has no matching tasks.")
-                elif first_page_api_had_malformed_tasks_key:
-                     print(f"   M-> Final Warn (Project: {project_id_context}): API returned data, but 'tasks' key was missing or invalid on first page. Cannot process tasks.")
-                elif first_page_api_had_unparsable_tasks:
-                     print(f"   M-> Final Warn (Project: {project_id_context}): API returned task items on first page, but none were parsable into valid MotionTask objects (check detailed 'Skipping unparsable' logs above).")
-                elif page_count > 1 :
-                    print(f"   M-> Final Info (Project: {project_id_context}): Processed {page_count} page(s), but no valid tasks were parsed into tasks_dict.")
-                elif page_count == 1 and not is_direct_list and not isinstance(data, dict):
-                     print(f"   M-> Final Warn (Project: {project_id_context}): API returned unexpected data type on first page. Cannot process tasks.")
+            if response.status_code in [200, 201]:
+                return response.json() if response.content else {"status": "success"}
+            elif response.status_code == 204:
+                return {"status": "success"}
+            elif response.status_code == 429:
+                if _retry_count >= cls.MAX_RETRIES:
+                    print(f"❌ Rate limited {cls.MAX_RETRIES} times on {method} {endpoint}. Giving up.")
+                    return None
+                try:
+                    retry_after = int(response.headers.get("Retry-After", 60))
+                except (ValueError, TypeError):
+                    retry_after = 60
+                print(f"⏳ Rate limited. Waiting {retry_after} seconds... (attempt {_retry_count + 1}/{cls.MAX_RETRIES})")
+                time.sleep(retry_after)
+                return cls._make_request(method, endpoint, json_data, params, _retry_count=_retry_count + 1)
             else:
-                print(f"   M-> Final Info (Project: {project_id_context}): Successfully parsed {len(tasks_dict)} tasks after processing {page_count} page(s).")
-
-            return tasks_dict
-        except Exception as e:
-            print(f"🚨 Exception during get_tasks_in_project for {project_id_context}: {e}")
-            print("--- Traceback for get_tasks_in_project ---")
-            traceback.print_exc()
-            print("--- End Traceback ---")
-            return {}
-
-    @classmethod
-    def create_workspace(cls, name: str) -> Optional[Dict]:
-        print(f" M-> Creating workspace: {name}...")
-        if SYNC_MODE == "dry_run": print(f" M-> [DRY RUN] Would create workspace: {name}"); return {"id": f"dry_run_ws_{name}", "name": name}
-        try:
-            created_ws = cls._make_request("POST", "workspaces", json_data={"name": name})
-            if created_ws and created_ws.get('id'): print(f" M-> ✨ Created workspace: {name} (ID: {created_ws['id']})"); return created_ws
-            print(f"🚨 Error creating workspace {name}: No ID. Response: {created_ws}"); return None
-        except Exception as e: print(f"🚨 Error creating workspace {name}: {e}"); return None
+                print(f"❌ HTTP {response.status_code} on {method} {endpoint}: {response.text}")
+                return None
+                
+        except requests.exceptions.RequestException as e:
+            print(f"❌ Request error on {method} {endpoint}: {e}")
+            return None
 
     @classmethod
     def create_project_in_workspace(cls, workspace_id: str, project_name: str, of_project_url: Optional[str] = None) -> Optional[Dict]:
         print(f" M-> Creating project: {project_name} in workspace {workspace_id}...")
         payload = {"name": project_name, "workspaceId": workspace_id}
-        description_parts = []
         if of_project_url:
-            description_parts.append(f"OmniFocus Project Link: {of_project_url}")
-        if description_parts:
-            payload["description"] = "\n\n---\n".join(description_parts)
-        if SYNC_MODE == "dry_run":
-            print(f" M-> [DRY RUN] Would create project: {project_name} with payload {payload}")
-            return {"id": f"dry_run_proj_{project_name}", "name": project_name, "workspaceId": workspace_id, "description": payload.get("description")}
-        try:
-            created_proj = cls._make_request("POST", "projects", json_data=payload)
-            if created_proj and created_proj.get('id'):
-                print(f" M-> ✨ Created project: {project_name} (ID: {created_proj['id']})")
-                return created_proj
-            print(f"🚨 Error creating project {project_name}: No ID. Response: {created_proj}. Payload: {json.dumps(payload)}")
-            return None
-        except Exception as e:
-            print(f"🚨 Error creating project {project_name}: {e}. Payload: {json.dumps(payload)}")
-            return None
+            payload["description"] = f"OmniFocus Project Link: {of_project_url}"
+        return cls._make_request("POST", "projects", json_data=payload)
 
     @classmethod
     def create_task_in_project(cls, project_id: str, workspace_id: str, task_name: str,
                                description: Optional[str] = None, of_task_url: Optional[str] = None,
-                               due_date_str: Optional[str] = None, duration_minutes: Optional[int] = None,
+                               due_date_str: Optional[str] = None, defer_date_str: Optional[str] = None,
+                               task_duration: Optional[Union[int, str]] = None,
                                schedule_name_to_use: Optional[str] = None,
-                               priority: str = "MEDIUM") -> Optional[Dict]:
-        print(f" M-> Creating task: {task_name} in project {project_id}...")
+                               priority: str = "MEDIUM",
+                               labels: Optional[List[str]] = None) -> Optional[Dict]:
         payload = {
-            "name": task_name,
-            "projectId": project_id,
-            "workspaceId": workspace_id,
-            "priority": priority
+            "name": task_name, "projectId": project_id,
+            "workspaceId": workspace_id, "priority": priority
         }
         
-        final_description_parts = []
-        if description: final_description_parts.append(description)
-        if of_task_url: final_description_parts.append(f"OmniFocus Link: {of_task_url}")
-        if final_description_parts: payload["description"] = "\n\n---\n".join(final_description_parts)
-        
-        current_due_date = due_date_str
+        desc = build_description(
+            body=description or "",
+            tags=labels if labels and isinstance(labels, list) else None,
+            of_url=of_task_url
+        )
+        if desc:
+            payload["description"] = desc
+
+        if due_date_str: payload["dueDate"] = due_date_str
+
+        # Note: scheduledStart is not supported by Motion API; defer dates are
+        # stored in the task description instead
+        if defer_date_str:
+            start_note = f"Start date: {defer_date_str}"
+            if "description" in payload:
+                payload["description"] = start_note + "\n\n" + payload["description"]
+            else:
+                payload["description"] = start_note
 
         if schedule_name_to_use:
-            auto_scheduled_payload = {"schedule": schedule_name_to_use}
-            print(f" M-> Assigning Schedule by NAME: '{schedule_name_to_use}' to task '{task_name}' via autoScheduled.schedule")
-            if not current_due_date:
-                default_due_datetime = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=14)
-                current_due_date = default_due_datetime.strftime("%Y-%m-%d")
-                print(f"   M-> No OF due date, default dueDate for scheduled task: {current_due_date}")
-            payload["autoScheduled"] = auto_scheduled_payload
-        else:
-            print(f" M-> Task '{task_name}' will use Motion's default scheduling (no specific schedule mapped).")
+            payload["autoScheduled"] = {"schedule": schedule_name_to_use}
+            if not due_date_str:
+                payload["dueDate"] = (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d")
 
-        if current_due_date:
-            payload["dueDate"] = current_due_date
+        if task_duration is not None: payload["duration"] = task_duration
         
-        if duration_minutes is not None and duration_minutes > 0:
-            payload["duration"] = duration_minutes
-        
-        print(f" M-> Setting task priority to: {priority}")
+        return cls._make_request("POST", "tasks", json_data=payload)
 
-        if SYNC_MODE != "sync":
-            print(f" M-> [{SYNC_MODE.upper()}] Would create task: {task_name} with payload {json.dumps(payload, indent=2)}")
-            return {"id": f"dry_run_task_{task_name}", "name": task_name, **payload}
-        try:
-            created_task = cls._make_request("POST", "tasks", json_data=payload)
-            if created_task and created_task.get('id'): print(f" M-> ✨ Created task: {task_name} (ID: {created_task['id']})"); return created_task
-            print(f"🚨 Error creating task '{task_name}': No ID. Response: {created_task}. Payload: {json.dumps(payload)}"); return None
-        except Exception as e: print(f"🚨 Error creating task '{task_name}': {e}. Payload: {json.dumps(payload)}"); return None
-
-    # *** ADDED METHOD ***
     @classmethod
-    def delete_task(cls, motion_task_id: str) -> bool:
-        """Deletes a task in Motion."""
-        print(f" M-> Attempting to DELETE Motion task ID: {motion_task_id}...")
-        if SYNC_MODE == "dry_run":
-            print(f" M-> [DRY RUN] Would DELETE Motion task {motion_task_id}.")
+    def update_task(cls, task_id: str, updates: Dict[str, Any]) -> Optional[Dict]:
+        """Update an existing task in Motion and return the full response object on success."""
+        payload = {}
+        if "priority" in updates: payload["priority"] = updates["priority"]
+        if "duration" in updates: payload["duration"] = updates.get("duration")
+        if "dueDate" in updates: payload["dueDate"] = updates.get("dueDate")
+        if "description" in updates: payload["description"] = updates.get("description")
+
+        if not payload:
+            print(f" M-> Info: No valid fields to update for task {task_id}. Skipping.")
+            return {"id": task_id, **updates}
+
+        print(f"    M-> Sending update for task {task_id} with payload: {payload}")
+        response = cls._make_request("PATCH", f"tasks/{task_id}", json_data=payload)
+        
+        if response is not None:
+            print(f" M-> ✨ Successfully updated task (ID: {task_id})")
+            return response
+        else:
+            print(f"🚨 Error updating task {task_id}. API response was None.")
+            return None
+
+    @classmethod
+    def complete_task(cls, task_id: str) -> bool:
+        """Mark a task as completed in Motion. Returns True on success."""
+        print(f" M-> Completing task (ID: {task_id})")
+        response = cls._make_request('PATCH', f'tasks/{task_id}', json_data={'status': 'completed'})
+        if response is not None:
+            print(f"     M-> ✨ Completed task successfully.")
             return True
+        print(f"     M-> ❌ Failed to complete task.")
+        return False
+
+# --- OmniFocus Manager (Write Operations) ---
+class OmniFocusManager:
+    """Handles writing data back to OmniFocus via JXA."""
+    
+    @staticmethod
+    def complete_task(task_id: str) -> bool:
+        """Mark an OmniFocus task as complete using AppleScript.
+
+        Uses try/on error to handle inbox tasks that reject mark complete,
+        falling back to assigning to first available project then completing.
+        """
+        applescript = f'''
+            tell application "OmniFocus"
+                if not running then return "omnifocus_not_running"
+                tell default document
+                    set matchedTasks to every flattened task whose id is "{task_id}"
+                    if (count of matchedTasks) is 0 then return "task_not_found"
+                    set theTask to item 1 of matchedTasks
+                    try
+                        mark complete theTask
+                        return "success"
+                    on error errMsg
+                        -- Inbox tasks can't be completed directly; assign to a project first
+                        if errMsg contains "inbox" then
+                            try
+                                set assigned container of theTask to first flattened project
+                                mark complete theTask
+                                return "success"
+                            on error errMsg2
+                                return "error:" & errMsg2
+                            end try
+                        else
+                            return "error:" & errMsg
+                        end if
+                    end try
+                end tell
+            end tell
+        '''
+
         try:
-            cls._make_request("DELETE", f"tasks/{motion_task_id}")
-            # DELETE often returns 204 No Content, which _make_request handles by returning None
-            print(f" M-> ✅ Successfully DELETED Motion task {motion_task_id}.")
-            return True
-        except requests.exceptions.HTTPError as e:
-             if hasattr(e, 'response') and e.response is not None:
-                  print(f"🚨 HTTP Error DELETING task {motion_task_id}: {e.response.status_code}")
-                  try: print(f"   API Error Details: {e.response.json()}")
-                  except json.JSONDecodeError: print(f"   API Response Body: {e.response.text}")
-             else: print(f"🚨 HTTP Error DELETING task {motion_task_id}: {e}")
-             return False
+            result = subprocess.run(
+                ["osascript", "-e", applescript],
+                text=True, capture_output=True, timeout=15, encoding='utf-8'
+            )
+
+            output = result.stdout.strip()
+
+            if output == 'success':
+                return True
+            elif output == 'task_not_found':
+                print(f"      ⚠️  OmniFocus task {task_id[:8]}... not found")
+                return False
+            elif output == 'omnifocus_not_running':
+                print(f"      ❌ OmniFocus is not running")
+                return False
+            elif output.startswith('error:'):
+                print(f"      ❌ OmniFocus error: {output[6:]}")
+                return False
+            else:
+                error_msg = result.stderr.strip() or output
+                print(f"      ❌ OmniFocus error: {error_msg}")
+                return False
+
+        except subprocess.TimeoutExpired:
+            print(f"      ❌ OmniFocus script timeout")
+            return False
         except Exception as e:
-            print(f"🚨 Unexpected Error DELETING task {motion_task_id}: {e}")
+            print(f"      ❌ Failed to complete OmniFocus task: {e}")
+            return False
+    
+    @staticmethod
+    def update_task(task_id: str, updates: Dict[str, Any]) -> bool:
+        """Update OmniFocus task fields using AppleScript."""
+        update_lines = []
+
+        if 'flagged' in updates:
+            val = "true" if updates['flagged'] else "false"
+            update_lines.append(f'set flagged of theTask to {val}')
+
+        if 'due_date' in updates and updates['due_date']:
+            update_lines.append(f'set due date of theTask to date "{updates["due_date"]}"')
+
+        if 'defer_date' in updates and updates['defer_date']:
+            update_lines.append(f'set defer date of theTask to date "{updates["defer_date"]}"')
+
+        if 'duration_minutes' in updates and updates['duration_minutes']:
+            update_lines.append(f'set estimated minutes of theTask to {updates["duration_minutes"]}')
+
+        if 'note' in updates and updates['note'] is not None:
+            escaped_note = updates['note'].replace('\\', '\\\\').replace('"', '\\"')
+            update_lines.append(f'set note of theTask to "{escaped_note}"')
+
+        if not update_lines:
+            return True  # Nothing to update
+
+        update_block = "\n                    ".join(update_lines)
+
+        applescript = f'''
+            tell application "OmniFocus"
+                if not running then return "omnifocus_not_running"
+                tell default document
+                    set matchedTasks to every flattened task whose id is "{task_id}"
+                    if (count of matchedTasks) is 0 then return "task_not_found"
+                    set theTask to item 1 of matchedTasks
+                    {update_block}
+                    return "success"
+                end tell
+            end tell
+        '''
+
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", applescript],
+                text=True, capture_output=True, timeout=10, encoding='utf-8'
+            )
+
+            output = result.stdout.strip()
+
+            if output == 'success':
+                return True
+            else:
+                error_msg = result.stderr.strip() or output
+                print(f"      ❌ OmniFocus update error: {error_msg}")
+                return False
+
+        except Exception as e:
+            print(f"      ❌ Failed to update OmniFocus task: {e}")
             return False
 
-# --- OmniFocus Data Retrieval ---
-class OmniFocusSync:
-    @classmethod
-    def get_structure(cls) -> List[OFFolder]:
-        print(" OF-> Fetching OmniFocus structure...")
+    @staticmethod
+    def create_task(project_name: str, task_name: str, note: str = "",
+                    due_date: Optional[str] = None, flagged: bool = False,
+                    estimated_minutes: Optional[int] = None) -> Optional[str]:
+        """Create a new task in an OmniFocus project. Returns the new task ID or None."""
+        escaped_name = task_name.replace('\\', '\\\\').replace('"', '\\"')
+        escaped_note = note.replace('\\', '\\\\').replace('"', '\\"') if note else ''
+        escaped_project = project_name.replace('\\', '\\\\').replace('"', '\\"')
+
+        # Build task properties
+        props = [f'name:"{escaped_name}"']
+        if escaped_note:
+            props.append(f'note:"{escaped_note}"')
+        if flagged:
+            props.append('flagged:true')
+        if estimated_minutes:
+            props.append(f'estimated minutes:{estimated_minutes}')
+
+        props_str = ", ".join(props)
+
+        # Due date needs to be set separately since AppleScript date parsing is tricky
+        due_date_line = ""
+        if due_date:
+            # due_date expected as "YYYY-MM-DD"
+            due_date_line = f'''
+                    set due date of newTask to date "{due_date}"'''
+
+        applescript = f'''
+            tell application "OmniFocus"
+                if not running then return "omnifocus_not_running"
+                tell default document
+                    set matchedProjects to every flattened project whose name is "{escaped_project}"
+                    if (count of matchedProjects) is 0 then return "project_not_found"
+                    set theProject to item 1 of matchedProjects
+                    set newTask to make new task at end of tasks of theProject with properties {{{props_str}}}
+                    {due_date_line}
+                    return id of newTask
+                end tell
+            end tell
+        '''
+
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", applescript],
+                text=True, capture_output=True, timeout=10, encoding='utf-8'
+            )
+
+            output = result.stdout.strip()
+
+            if output == 'omnifocus_not_running':
+                print(f"      ❌ OmniFocus is not running")
+                return None
+            elif output == 'project_not_found':
+                print(f"      ⚠️  OmniFocus project '{project_name}' not found")
+                return None
+            elif output and not output.startswith('error'):
+                return output  # This is the new task ID
+            else:
+                error_msg = result.stderr.strip() or output
+                print(f"      ❌ OmniFocus create error: {error_msg}")
+                return None
+
+        except subprocess.TimeoutExpired:
+            print(f"      ❌ OmniFocus script timeout")
+            return None
+        except Exception as e:
+            print(f"      ❌ Failed to create OmniFocus task: {e}")
+            return None
+
+# --- Task ID Mapping Manager ---
+class TaskIDMapper:
+    """Manages bidirectional mapping between OmniFocus and Motion task IDs."""
+    
+    def __init__(self, state_data: Dict):
+        self.state_data = state_data
+        if 'task_mappings' not in self.state_data:
+            self.state_data['task_mappings'] = {}
+    
+    def add_mapping(self, of_id: str, motion_id: str, workspace: str, project: str, task_name: str):
+        """Store bidirectional ID mapping."""
+        mapping_key = self._create_key(of_id, motion_id)
+        self.state_data['task_mappings'][mapping_key] = {
+            'of_id': of_id,
+            'motion_id': motion_id,
+            'workspace': workspace,
+            'project': project,
+            'task_name': task_name,
+            'created_at': datetime.now(timezone.utc).isoformat()
+        }
+    
+    def get_motion_id_from_of(self, of_id: str) -> Optional[str]:
+        """Find Motion ID given OmniFocus ID."""
+        for mapping in self.state_data['task_mappings'].values():
+            if mapping.get('of_id') == of_id:
+                return mapping.get('motion_id')
+        return None
+    
+    def get_of_id_from_motion(self, motion_id: str) -> Optional[str]:
+        """Find OmniFocus ID given Motion ID."""
+        for mapping in self.state_data['task_mappings'].values():
+            if mapping.get('motion_id') == motion_id:
+                return mapping.get('of_id')
+        return None
+    
+    def get_mapping(self, of_id: Optional[str] = None, motion_id: Optional[str] = None) -> Optional[Dict]:
+        """Get full mapping by either ID."""
+        for mapping in self.state_data['task_mappings'].values():
+            if (of_id and mapping.get('of_id') == of_id) or \
+               (motion_id and mapping.get('motion_id') == motion_id):
+                return mapping
+        return None
+    
+    def update_task_name(self, of_id: str, motion_id: str, new_name: str):
+        """Update task name in mapping (for rename detection)."""
+        mapping_key = self._create_key(of_id, motion_id)
+        if mapping_key in self.state_data['task_mappings']:
+            self.state_data['task_mappings'][mapping_key]['task_name'] = new_name
+            self.state_data['task_mappings'][mapping_key]['updated_at'] = datetime.now(timezone.utc).isoformat()
+    
+    def remove_mapping(self, of_id: Optional[str] = None, motion_id: Optional[str] = None):
+        """Remove mapping when task is deleted."""
+        keys_to_remove = []
+        for key, mapping in self.state_data['task_mappings'].items():
+            if (of_id and mapping.get('of_id') == of_id) or \
+               (motion_id and mapping.get('motion_id') == motion_id):
+                keys_to_remove.append(key)
+        
+        for key in keys_to_remove:
+            del self.state_data['task_mappings'][key]
+    
+    @staticmethod
+    def _create_key(of_id: str, motion_id: str) -> str:
+        """Create composite key for mapping."""
+        return f"{of_id}::{motion_id}"
+
+# --- Main Sync Class ---
+class MotionHybridSync:
+    def __init__(self, api_key: str, config: Optional[Config] = None):
+        self.api_key = api_key
+        
+        # Load configuration (or use provided config object)
+        self.config = config if config else Config()
+        
+        # Load mappings from config
+        self.workspace_schedule_mapping = self.config.workspace_schedules
+        self.workspace_mapping = self.config.workspace_mapping
+        self.ignored_folders = self.config.ignored_folders
+        
+        self.last_sync_timestamp = None
+        self.id_mapper = None  # ✅ Will be initialized when state is loaded
+
+    @staticmethod
+    def map_of_priority_to_motion(of_task: OFTask) -> str:
+        """
+        Map OmniFocus priority to Motion priority.
+        Priority hierarchy:
+        1. Flagged = ASAP (urgent!)
+        2. High priority tag = HIGH
+        3. Medium priority tag = MEDIUM (default)
+        4. Low priority tag = LOW
+        """
+        # Flagged tasks are always ASAP (most urgent)
+        if getattr(of_task, 'flagged', False):
+            return "ASAP"
+        
+        # Check for explicit priority tags
+        of_priority = getattr(of_task, 'of_priority', None)
+        if of_priority:
+            priority_map = {
+                'high': 'HIGH',
+                'medium': 'MEDIUM',
+                'low': 'LOW'
+            }
+            return priority_map.get(of_priority.lower(), 'MEDIUM')
+        
+        # Default to MEDIUM if no priority specified
+        return "MEDIUM"
+
+    def check_local_data_exists(self) -> bool:
+        """Check if local mapping file exists."""
+        return os.path.exists('motion_hierarchical_mapping.json')
+    
+    def get_workspaces(self) -> Dict[str, Dict]:
+        print("🔍 Fetching Motion workspaces...")
+        # ✅ FIXED: Use MotionSync._make_request() instead of duplicate method
+        data = MotionSync._make_request("GET", "workspaces")
+        if not data or "workspaces" not in data:
+            print("❌ Failed to fetch workspaces")
+            return {}
+        workspaces = {w.get("name"): w for w in data["workspaces"] if w.get("name")}
+        print(f"✅ Found {len(workspaces)} workspaces")
+        return workspaces
+    
+    def get_projects_for_workspace(self, workspace_id: str, workspace_name: str) -> Dict[str, Dict]:
+        print(f"  📁 Fetching projects for workspace: {workspace_name}")
+        projects, cursor = {}, None
+        while True:
+            params = {"workspaceId": workspace_id}
+            if cursor: params["cursor"] = cursor
+            data = MotionSync._make_request("GET", "projects", params=params)
+            if not data or "projects" not in data: break
+            for p in data["projects"]:
+                if p_name := p.get("name"): projects[p_name] = p
+            if not (cursor := data.get("meta", {}).get("nextCursor")): break
+        print(f"  📊 Total projects in {workspace_name}: {len(projects)}")
+        return projects
+    
+    def get_tasks_for_project(self, project_id: str, project_name: str) -> Dict[str, Dict]:
+        print(f"      Fetching tasks for project: {project_name}")
+        tasks, cursor = {}, None
+        while True:
+            params = {"projectId": project_id}
+            if cursor: params["cursor"] = cursor
+            data = MotionSync._make_request("GET", "tasks", params=params)
+            if not data or "tasks" not in data: break
+            for t in data["tasks"]:
+                if t_name := t.get("name"): tasks[t_name] = t
+            if not (cursor := data.get("meta", {}).get("nextCursor")): break
+        print(f"      📊 Total tasks in project '{project_name}': {len(tasks)}")
+        return tasks
+    
+    def create_comprehensive_mapping(self) -> Dict:
+        print("🚀 Starting comprehensive Motion mapping creation...")
+        workspaces = self.get_workspaces()
+        if not workspaces: return {}
+
+        # Preserve existing task_mappings when refreshing
+        existing_data = self.load_motion_data_from_file()
+        existing_mappings = existing_data.get('task_mappings', {})
+
+        mapping_data = {"workspaces": {}, "task_mappings": existing_mappings}
+        total_projects, total_tasks = 0, 0
+
+        for ws_name, ws_data in workspaces.items():
+            print(f"\n🏢 Processing workspace: {ws_name}")
+            ws_id = ws_data["id"]
+            projects = self.get_projects_for_workspace(ws_id, ws_name)
+            for p_name, p_data in projects.items():
+                p_id = p_data["id"]
+                p_data["tasks"] = self.get_tasks_for_project(p_id, p_name)
+                total_tasks += len(p_data["tasks"])
+                time.sleep(self.config.api_rate_limit_delay)
+            mapping_data["workspaces"][ws_name] = {
+                "id": ws_id, "type": ws_data.get("type"),
+                "labels": ws_data.get("labels", []), "projects": projects
+            }
+            total_projects += len(projects)
+            time.sleep(self.config.workspace_processing_delay)
+
+        print(f"\n🎯 HIERARCHICAL MAPPING COMPLETE! Workspaces: {len(workspaces)}, Projects: {total_projects}, Tasks: {total_tasks}")
+        self.save_motion_data_to_file(mapping_data, update_timestamp=False)
+        return mapping_data
+
+    def load_motion_data_from_file(self) -> Dict:
+        """Loads the entire motion data structure from the local JSON file."""
+        filename = "motion_hierarchical_mapping.json"
+        if not os.path.exists(filename):
+            print(f"⚠️ No local data file found at '{filename}'. A new one will be created.")
+            data = {"metadata": {}, "workspaces": {}, "task_mappings": {}}
+            self.id_mapper = TaskIDMapper(data)  # ✅ Initialize mapper
+            return data
+        
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            # ✅ Ensure task_mappings exists
+            if 'task_mappings' not in data:
+                data['task_mappings'] = {}
+            
+            # ✅ Initialize ID mapper with loaded data
+            self.id_mapper = TaskIDMapper(data)
+            
+            return data
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"❌ Error reading '{filename}': {e}. Starting with empty data.")
+            data = {"metadata": {}, "workspaces": {}, "task_mappings": {}}
+            self.id_mapper = TaskIDMapper(data)
+            return data
+
+    def save_motion_data_to_file(self, motion_data: Dict, update_timestamp: bool = True):
+        """
+        Updates the JSON file with new data and optionally updates the sync timestamp.
+        """
+        filename = "motion_hierarchical_mapping.json"
+        
+        current_data = motion_data
+        if 'metadata' not in current_data: current_data['metadata'] = {}
+
+        current_data['metadata']['total_workspaces'] = len(current_data.get('workspaces', {}))
+        current_data['metadata']['total_projects'] = sum(len(ws.get("projects", {})) for ws in current_data.get('workspaces', {}).values())
+        current_data['metadata']['total_tasks'] = sum(sum(len(p.get("tasks", {})) for p in ws.get("projects", {}).values()) for ws in current_data.get('workspaces', {}).values())
+        
+        if update_timestamp:
+            new_timestamp = datetime.now(timezone.utc).isoformat()
+            current_data['metadata']['last_sync_timestamp'] = new_timestamp
+            print(f"💾 Saving with new sync timestamp: {new_timestamp}")
+        
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(current_data, f, indent=2, ensure_ascii=False)
+            print(f"✅ Motion data saved successfully to {filename}")
+        except IOError as e:
+            print(f"❌ Error saving motion data to file: {e}")
+
+    def load_omnifocus_structure(self):
+        """Load OmniFocus data structure using JXA script."""
+        print("📱 Loading OmniFocus structure...")
         jxa_script = r"""
         (() => {
-          const of = Application('OmniFocus');
-          if (!of.running()) { return JSON.stringify({error: "OmniFocus is not running."}); }
-          const formatDate = (date) => {
-            if (!date) return null;
-            return `${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, '0')}-${date.getDate().toString().padStart(2, '0')}`;
-          };
-          const folders = of.defaultDocument.folders();
-          const structure = [];
-          folders.forEach(f => {
-            if (!f || !f.name || typeof f.name !== 'function' || !f.id || typeof f.id !== 'function') return;
-            const folderId = f.id(); const folderName = f.name();
-            if (!folderId || !folderName) return;
-            const folderData = { id: folderId, name: folderName, projects: [] };
-            try {
+            const of = Application('OmniFocus');
+            if (!of.running()) { return JSON.stringify({error: "OmniFocus is not running."}); }
+            const formatDate = (date) => {
+                if (!date || !(date instanceof Date) || isNaN(date.getTime())) return null;
+                return `${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, '0')}-${date.getDate().toString().padStart(2, '0')}`;
+            };
+            const processProject = (p) => {
+                if (!p || !p.id || typeof p.id !== 'function' || !p.name || typeof p.name !== 'function') return null;
+                let projectStatus = ''; try { projectStatus = p.status(); } catch(e) {}
+                let isDropped = false; try { isDropped = p.dropped(); } catch(e) {}
+                if (isDropped || projectStatus === 'on hold') return null;
+                const projectData = {
+                    id: p.id(), name: p.name(), url: 'omnifocus:///project/' + p.id(),
+                    modificationDate: p.modificationDate() ? p.modificationDate().toISOString() : null,
+                    completed: p.completed(), tasks: []
+                };
+                try {
+                    p.flattenedTasks().forEach(t => {
+                        if (!t || !t.id || typeof t.id !== 'function' || !t.name || typeof t.name !== 'function') return;
+                        const taskName = t.name();
+                        if (!taskName || taskName === '-----------') return;
+                        
+                        let isDropped = false; try { isDropped = t.dropped(); } catch(e) {}
+                        if (isDropped) return;
+
+                        let estimatedMins = null;
+                        try { const mr = t.estimatedMinutes(); if (typeof mr === 'number' && mr > 0) estimatedMins = mr; } catch (e) {}
+                        
+                        // ✅ NEW: Capture defer date (start date)
+                        let deferDate = null;
+                        try { deferDate = formatDate(t.deferDate()); } catch (e) {}
+                        
+                        // ✅ NEW: Capture contexts/tags
+                        let contexts = [];
+                        let ofPriority = null;  // Track OF priority separately
+                        try { 
+                            const taskTags = t.tags();
+                            taskTags.forEach(tag => {
+                                const tagName = tag.name();
+                                contexts.push(tagName);
+                                
+                                // Detect priority tags
+                                const tagLower = tagName.toLowerCase();
+                                if (tagLower === 'high' || tagLower === 'high priority') ofPriority = 'high';
+                                else if (tagLower === 'medium' || tagLower === 'medium priority') ofPriority = 'medium';
+                                else if (tagLower === 'low' || tagLower === 'low priority') ofPriority = 'low';
+                            });
+                        } catch (e) {}
+                        
+                        // ✅ NEW: Capture repeat rule
+                        let repeatRule = null;
+                        try {
+                            const rule = t.repetitionRule();
+                            if (rule) repeatRule = rule.ruleString();
+                        } catch (e) {}
+                        
+                        projectData.tasks.push({
+                            id: t.id(), name: taskName, note: t.note() || null, completed: t.completed(),
+                            url: 'omnifocus:///task/' + t.id(), dueDate: formatDate(t.dueDate()),
+                            deferDate: deferDate,  // ✅ NEW
+                            durationMinutes: estimatedMins, flagged: t.flagged(),
+                            contexts: contexts,  // ✅ NEW
+                            ofPriority: ofPriority,  // ✅ NEW: Explicit priority
+                            repeatRule: repeatRule,  // ✅ NEW
+                            modificationDate: t.modificationDate() ? t.modificationDate().toISOString() : null
+                        });
+                    });
+                } catch (e) {}
+                return projectData;
+            };
+            const structure = [];
+            of.defaultDocument.folders().forEach(f => {
+                if (!f || !f.name || typeof f.name !== 'function') return;
+                const folderData = { id: f.id(), name: f.name(), projects: [] };
                 f.flattenedProjects().forEach(p => {
-                  if (!p || !p.id || typeof p.id !== 'function' || !p.name || typeof p.name !== 'function') return;
-                  const projectId = p.id(); const projectName = p.name();
-                  if (!projectId || !projectName) return;
-                  const projectUrl = 'omnifocus:///project/' + projectId;
-                  const projectModDate = p.modificationDate() ? p.modificationDate().toISOString() : null; 
-                  const projectData = { id: projectId, name: projectName, url: projectUrl, modificationDate: projectModDate, tasks: [] };
-                  try {
-                      p.flattenedTasks().forEach(t => {
-                         if (!t || !t.id || typeof t.id !== 'function' || !t.name || typeof t.name !== 'function') return;
-                         const taskId = t.id(); const taskName = t.name();
-                         if (!taskId || !taskName || taskName === '-----------') return;
-                         let dueDateFormatted = null; try { const dr = t.dueDate(); if (dr) dueDateFormatted = formatDate(dr); } catch (e) {}
-                         let estimatedMins = null; try { const mr = t.estimatedMinutes(); if (typeof mr === 'number' && mr > 0) estimatedMins = mr; } catch (e) {}
-                         let isFlagged = false; try { isFlagged = t.flagged(); } catch (e) {} 
-                         let taskModDate = t.modificationDate() ? t.modificationDate().toISOString() : null; 
-                         let isCompleted = false; try { isCompleted = t.completed(); } catch (e) {}
-                         projectData.tasks.push({ 
-                             id: taskId, name: taskName, 
-                             note: t.note() || null, completed: isCompleted,
-                             url: 'omnifocus:///task/' + taskId, 
-                             dueDate: dueDateFormatted, 
-                             durationMinutes: estimatedMins,
-                             flagged: isFlagged,
-                             modificationDate: taskModDate 
-                         });
-                      });
-                  } catch (taskError) { console.error(`Error tasks for project '${projectName}': ${taskError}`); }
-                  folderData.projects.push(projectData);
+                    const projectData = processProject(p);
+                    if (projectData) folderData.projects.push(projectData);
                 });
-            } catch (projectError) { console.error(`Error projects for folder '${folderName}': ${projectError}`); }
-            structure.push(folderData);
-          });
-          return JSON.stringify(structure);
+                structure.push(folderData);
+            });
+            const standaloneFolderData = { id: 'standalone', name: 'Standalone Projects', projects: [] };
+            of.defaultDocument.projects().forEach(p => {
+                const projectData = processProject(p);
+                if (projectData) standaloneFolderData.projects.push(projectData);
+            });
+            if (standaloneFolderData.projects.length > 0) structure.push(standaloneFolderData);
+            return JSON.stringify(structure);
         })();
         """
         try:
             result = subprocess.run(["osascript", "-l", "JavaScript", "-e", jxa_script], text=True, capture_output=True, check=True, encoding='utf-8')
-            if '"error":' in result.stdout[:100]:
-                 try: error_data = json.loads(result.stdout); print(f"🚨 JXA Error: {error_data.get('error', 'Unknown')}"); return []
-                 except json.JSONDecodeError: print(f"🚨 JXA Error (raw): {result.stdout}"); return []
-            raw_data: List[Dict] = json.loads(result.stdout)
+            raw_data = json.loads(result.stdout)
+            
+            # ✅ FIXED: Check for error response from OmniFocus
+            if isinstance(raw_data, dict) and 'error' in raw_data:
+                print(f"❌ OmniFocus error: {raw_data['error']}")
+                return []
+            
             of_structure = []
-            for fr in raw_data:
-                if not isinstance(fr, dict) or not fr.get('id') or not fr.get('name'): continue
-                folder = OFFolder(id=fr['id'], name=fr['name'])
-                for pr in fr.get('projects', []):
-                     if not isinstance(pr, dict) or not pr.get('id') or not pr.get('name'): continue
-                     proj_url = pr.get('url') if isinstance(pr.get('url'), str) else None
-                     proj_mod_date = pr.get('modificationDate')
-                     project = OFProject(id=pr['id'], name=pr['name'], url=proj_url, of_modification_date=proj_mod_date)
-                     for tr in pr.get('tasks', []):
-                         if not isinstance(tr, dict) or not tr.get('id') or not tr.get('name'): continue
-                         task_mod_date = tr.get('modificationDate')
-                         task = OFTask(id=tr['id'], name=tr['name'], note=tr.get('note'),
-                                       completed=tr.get('completed', False), url=tr.get('url'),
-                                       due_date=tr.get('dueDate'), duration_minutes=tr.get('durationMinutes'),
-                                       flagged=tr.get('flagged', False), of_modification_date=task_mod_date)
-                         project.tasks.append(task)
-                     folder.projects.append(project)
+            for fr_data in raw_data:
+                folder = OFFolder(id=fr_data['id'], name=fr_data['name'])
+                for pr_data in fr_data.get('projects', []):
+                    project = OFProject(id=pr_data['id'], name=pr_data['name'], url=pr_data.get('url'),
+                                        of_modification_date=pr_data.get('modificationDate'), completed=pr_data.get('completed', False))
+                    for tr_data in pr_data.get('tasks', []):
+                        task = OFTask(id=tr_data['id'], name=tr_data['name'], note=tr_data.get('note'),
+                                      completed=tr_data.get('completed', False), url=tr_data.get('url'),
+                                      due_date=tr_data.get('dueDate'),
+                                      defer_date=tr_data.get('deferDate'),  # ✅ NEW
+                                      duration_minutes=tr_data.get('durationMinutes'),
+                                      flagged=tr_data.get('flagged', False),
+                                      of_modification_date=tr_data.get('modificationDate'),
+                                      contexts=tr_data.get('contexts', []),  # ✅ NEW
+                                      repeat_rule=tr_data.get('repeatRule'),  # ✅ NEW
+                                      of_priority=tr_data.get('ofPriority'))  # ✅ NEW
+                        project.tasks.append(task)
+                    folder.projects.append(project)
                 of_structure.append(folder)
-            print(f" OF-> Found {len(of_structure)} OF folders processed."); return of_structure
-        except subprocess.CalledProcessError as e: print(f"🚨 Error JXA: {e.stderr or e.stdout or e}"); return []
-        except json.JSONDecodeError as e: print(f"🚨 Error JXA JSON: {e}. Output: {result.stdout[:500]}..."); return []
-        except Exception as e: print(f"🚨 Unexpected OF error: {e}"); traceback.print_exc(); return []
-
-# --- Synchronization Logic ---
-class ProjectSynchronizer:
-    def __init__(self, config: SyncConfig):
-        self.config = config
-        self.stats = { "folders_processed": 0, "folders_skipped": 0, "workspaces_matched": 0, "workspaces_created": 0,
-                       "projects_processed": 0, "projects_skipped_not_modified": 0,
-                       "projects_matched": 0, "projects_created": 0, "projects_link_added": 0,
-                       "tasks_processed": 0, "tasks_skipped_not_modified": 0,
-                       "tasks_skipped_due_to_unmodified_project": 0,
-                       "tasks_matched": 0, "tasks_created": 0,
-                       "tasks_deleted_in_motion": 0, # New Stat
-                       "tasks_created_with_due_date": 0, "tasks_created_with_duration": 0,
-                       "tasks_created_with_schedule": 0,
-                       "tasks_created_with_high_priority": 0,
-                       "tasks_created_with_medium_priority": 0,
-                       "tasks_skipped_completed_of": 0,
-                       "errors_workspace_creation": 0, "errors_project_creation": 0, "errors_task_creation": 0,
-                       "errors_task_deletion": 0, # New Stat
-                       "get_tasks_api_errors": 0, "schedule_mapping_warnings": 0,
-                     }
-        self.of_structure: List[OFFolder] = []
-        self.motion_workspaces: Dict[str, Dict] = {}
-        self.motion_schedule_names: Set[str] = set()
-        self.last_sync_timestamp: Optional[str] = self._load_last_sync_timestamp()
-        # Removed motion_completed_status_id and workspace_completed_status_ids
-        print(f"ℹ️ Loaded last sync timestamp: {self.last_sync_timestamp or 'None (first run or state file missing)'}")
-
-
-    def _load_last_sync_timestamp(self) -> Optional[str]:
-        try:
-            if os.path.exists(STATE_FILE):
-                with open(STATE_FILE, 'r') as f:
-                    state_data = json.load(f)
-                    return state_data.get("last_run_utc_iso_timestamp")
-        except (IOError, json.JSONDecodeError) as e:
-            print(f"⚠️ Error loading state file '{STATE_FILE}': {e}. Will perform a full sync.")
-        return None
-
-    def _save_last_sync_timestamp(self, timestamp_str: str):
-        try:
-            with open(STATE_FILE, 'w') as f:
-                json.dump({"last_run_utc_iso_timestamp": timestamp_str}, f, indent=2)
-            print(f"💾 Saved current sync timestamp: {timestamp_str} to '{STATE_FILE}'")
-        except IOError as e:
-            print(f"⚠️ Error saving state file '{STATE_FILE}': {e}")
-
-
-    def _fetch_data(self):
-        print("\n--- Fetching Data ---")
-        self.of_structure = OmniFocusSync.get_structure()
-        if not isinstance(self.of_structure, list): print("❌ Critical: Failed OF structure fetch."); return False
-        elif not self.of_structure: print("ℹ️ Info: No OF folders found.")
-        
-        self.motion_workspaces = MotionSync.get_workspaces()
-        if not isinstance(self.motion_workspaces, dict): print("❌ Critical: Failed Motion workspaces fetch."); return False
-        elif not self.motion_workspaces: print("ℹ️ Info: No Motion workspaces found.")
-        
-        self.motion_schedule_names = MotionSync.get_schedules()
-        if not isinstance(self.motion_schedule_names, set): print("⚠️ Warn: Failed Motion schedules fetch or no usable schedule names found.")
             
-        print("--- Data Fetch Complete ---"); return True
+            print(f"📱 Found {len(of_structure)} OF folders, {sum(len(f.projects) for f in of_structure)} projects, {sum(len(p.tasks) for f in of_structure for p in f.projects)} tasks.")
+            return of_structure
+        except Exception as e: 
+            print(f"🚨 Unexpected OF error: {e}")
+            return []
 
-    def _find_motion_match(self, of_name: str, motion_dict: Dict[str, Dict]) -> Optional[Dict]:
-        if of_name is None: return None
-        if of_name in motion_dict: return motion_dict[of_name]
-        if not self.config.strict_matching:
-            norm_of_name = of_name.lower().strip()
-            for m_name, m_item in motion_dict.items():
-                if isinstance(m_name, str) and m_name.lower().strip() == norm_of_name:
-                    print(f"   -> Loose match for '{of_name}': '{m_name}'"); return m_item
-        return None
+    def sync_omnifocus_to_motion(self):
+        """Real OmniFocus to Motion synchronization using local JSON data."""
+        print(" Starting OmniFocus to Motion synchronization...")
+        local_data = self.load_motion_data_from_file()
+        # Load OF structure only if not already loaded (standalone mode)
+        if not self.of_structure:
+            self.of_structure = self.load_omnifocus_structure()
+        if not self.of_structure:
+            print("❌ Failed to load OmniFocus structure. Cannot proceed with sync.")
+            return
+        self.perform_sync_comparison_from_structure(local_data)
+        print("✅ Synchronization completed!")
 
-    def sync(self):
-        if not self._fetch_data(): return
-        print("\n--- Starting Synchronization ---"); print(f"Sync Mode: {SYNC_MODE.upper()}")
-        print(f"Config: {self.config}"); print(f"Skip Folders: {self.config.skip_folders or 'None'}")
-        print(f"Workspace->Schedule Map: {WORKSPACE_TO_SCHEDULE_MAP or 'None'}")
-        print(f"Verified Motion Schedule Names: {self.motion_schedule_names or 'None found'}")
+    def refresh_motion_task_statuses(self, motion_data: Dict):
+        """Check mapped tasks for completions in Motion.
 
-        overall_sync_successful = True
+        Optimization: Only checks tasks that are NOT already completed in local
+        data AND were NOT found by refresh_motion_tasks_from_api (which fetches
+        active tasks). If a mapped task isn't in any project's active task list,
+        it may have been completed - check it individually.
+        """
+        if not self.id_mapper:
+            return motion_data
 
-        try:
-            for of_folder in self.of_structure:
-                self.stats["folders_processed"] += 1; folder_name = of_folder.name
-                if folder_name in self.config.skip_folders:
-                    print(f"\n🚫 Skipping OF Folder: '{folder_name}'"); self.stats["folders_skipped"] += 1; continue
-                print(f"\n📁 Processing OF Folder: '{folder_name}'")
-                motion_ws = self._find_motion_match(folder_name, self.motion_workspaces)
-                if not motion_ws:
-                    if self.config.create_missing_workspaces:
-                        print(f"   Creating Motion workspace for '{folder_name}'...")
-                        created_ws = MotionSync.create_workspace(folder_name)
-                        if created_ws: motion_ws = created_ws; self.stats["workspaces_created"] += 1
-                        if SYNC_MODE != "dry_run" and created_ws: self.motion_workspaces[created_ws['name']] = created_ws
-                        else: print(f"   ❌ Fail create workspace '{folder_name}'. Skip."); self.stats["errors_workspace_creation"] += 1; overall_sync_successful=False; continue
-                    else: print(f"   ❌ No Motion workspace for '{folder_name}'. Skip."); continue
-                else: print(f"   ✅ Matched Motion Workspace: '{motion_ws['name']}' (ID: {motion_ws.get('id')})"); self.stats["workspaces_matched"] += 1
-                
-                ws_id = motion_ws.get('id')
-                if not ws_id: print(f"   ❌ Workspace '{motion_ws.get('name')}' no ID. Skip."); self.stats["errors_workspace_creation"]+=1; overall_sync_successful=False; continue
-                
-                motion_projs_in_ws = {}
-                if not ws_id.startswith("dry_run_ws_"): motion_projs_in_ws = MotionSync.get_projects_in_workspace(ws_id)
+        mappings = self.id_mapper.state_data.get('task_mappings', {})
+        if not mappings:
+            return motion_data
 
-                for of_project in of_folder.projects:
-                    self.stats["projects_processed"] += 1; proj_name = of_project.name
-                    
-                    project_is_new_or_modified_in_of = (not self.last_sync_timestamp) or \
-                                                       (of_project.of_modification_date and \
-                                                        self.last_sync_timestamp and \
-                                                        of_project.of_modification_date > self.last_sync_timestamp)
-                    
-                    if not project_is_new_or_modified_in_of and self.last_sync_timestamp:
-                        any_task_modified_in_project = False
-                        for of_task_check in of_project.tasks:
-                            if (not self.last_sync_timestamp or
-                                (of_task_check.of_modification_date and \
-                                 of_task_check.of_modification_date > self.last_sync_timestamp)):
-                                any_task_modified_in_project = True
-                                break
-                        if not any_task_modified_in_project:
-                            print(f"  ⏭️ Skipping OF Project '{proj_name}' (project & its tasks not modified in OF since {self.last_sync_timestamp})")
-                            self.stats["projects_skipped_not_modified"] += 1
-                            self.stats["tasks_skipped_due_to_unmodified_project"] = self.stats.get("tasks_skipped_due_to_unmodified_project", 0) + len(of_project.tasks)
-                            continue
-                        else:
-                            print(f"  ℹ️ OF Project '{proj_name}' itself not modified, but contains modified tasks. Processing project.")
-                            project_is_new_or_modified_in_of = True
-                    
-                    print(f"\n  📝 Processing OF Project: '{proj_name}'" + (" (new/modified in OF)" if project_is_new_or_modified_in_of and self.last_sync_timestamp else ""))
+        # Build set of all active Motion task IDs currently in local data
+        active_motion_ids = set()
+        for ws_data in motion_data.get('workspaces', {}).values():
+            for proj_data in ws_data.get('projects', {}).values():
+                for task_data in proj_data.get('tasks', {}).values():
+                    status = (task_data.get('status') or {}).get('name', '').lower()
+                    if status != 'completed' and task_data.get('id'):
+                        active_motion_ids.add(task_data['id'])
 
-                    motion_proj_initially_exists = self._find_motion_match(proj_name, motion_projs_in_ws)
-                    motion_proj = motion_proj_initially_exists
-                    motion_project_was_created_this_run = False
+        # Only check tasks that are mapped but NOT in the active list
+        # (they may have been completed or deleted in Motion)
+        tasks_to_check = []
+        for mapping in mappings.values():
+            motion_id = mapping.get('motion_id')
+            if not motion_id:
+                continue
+            # Skip if already known to be active (just refreshed from API)
+            if motion_id in active_motion_ids:
+                continue
+            # Skip if already marked completed in local data
+            ws_name = mapping.get('workspace', '')
+            proj_name = mapping.get('project', '')
+            task_name = mapping.get('task_name', '')
+            proj_tasks = motion_data.get('workspaces', {}).get(ws_name, {}).get('projects', {}).get(proj_name, {}).get('tasks', {})
+            if task_name in proj_tasks:
+                local_status = (proj_tasks[task_name].get('status') or {}).get('name', '').lower()
+                if local_status == 'completed':
+                    continue
+            tasks_to_check.append(mapping)
 
-                    if not motion_proj:
-                        if self.config.create_missing_projects:
-                            print(f"     Creating Motion project for '{proj_name}'...")
-                            created_proj = MotionSync.create_project_in_workspace(ws_id, proj_name, of_project_url=of_project.url)
-                            if created_proj:
-                                motion_proj = created_proj; self.stats["projects_created"] += 1
-                                motion_project_was_created_this_run = True
-                                if of_project.url: self.stats["projects_link_added"] += 1
-                                if SYNC_MODE != "dry_run": motion_projs_in_ws[created_proj['name']] = created_proj
-                            else: print(f"     ❌ Fail create project '{proj_name}'. Skip."); self.stats["errors_project_creation"] += 1; overall_sync_successful=False; continue
-                        else: print(f"     ❌ No Motion project for '{proj_name}'. Skip."); continue
-                    else: print(f"     ✅ Matched Motion Project: '{motion_proj['name']}' (ID: {motion_proj.get('id')})"); self.stats["projects_matched"] += 1
-                    
-                    proj_id = motion_proj.get('id')
-                    if not proj_id: print(f"     ❌ Project '{motion_proj.get('name')}' no ID. Skip."); self.stats["errors_project_creation"]+=1; overall_sync_successful=False; continue
+        if not tasks_to_check:
+            print("🔄 No tasks need completion status check")
+            return motion_data
 
-                    # Fetch tasks from Motion for comparison and potential deletion
-                    motion_tasks_in_proj_for_this_project = {} # Use a local variable for this project's tasks
-                    if not proj_id.startswith("dry_run_proj_"):
-                        print(f"       Fetching tasks for Motion project '{motion_proj['name']}' (ID: {proj_id})...")
-                        motion_tasks_in_proj_for_this_project = MotionSync.get_tasks_in_project(proj_id, ws_id)
-                        # Note: get_tasks_api_errors is incremented within get_tasks_in_project if it has issues,
-                        # but it returns {} on error, so we still proceed.
-                    
-                    print(f"       Comparing {len(of_project.tasks)} OF tasks with {len(motion_tasks_in_proj_for_this_project)} Motion tasks for project '{proj_name}'...")
-                    for of_task in of_project.tasks:
-                        self.stats["tasks_processed"] += 1; task_name = of_task.name
-                        
-                        task_is_new_or_modified_in_of = (not self.last_sync_timestamp) or \
-                                                        (of_task.of_modification_date and \
-                                                         self.last_sync_timestamp and \
-                                                         of_task.of_modification_date > self.last_sync_timestamp)
-                        
-                        motion_task_data = motion_tasks_in_proj_for_this_project.get(task_name)
+        print(f"🔄 Checking {len(tasks_to_check)} task(s) for Motion completion status...")
+        completed_count = 0
 
-                        if of_task.completed and task_is_new_or_modified_in_of and motion_task_data:
-                            print(f"         🔄 OF task '{task_name}' is completed and recent. Attempting to DELETE Motion task ID: {motion_task_data.id}.")
-                            if MotionSync.delete_task(motion_task_data.id):
-                                self.stats["tasks_deleted_in_motion"] += 1
-                                # Remove from our local cache so we don't try to act on it again
-                                if task_name in motion_tasks_in_proj_for_this_project:
-                                    del motion_tasks_in_proj_for_this_project[task_name]
-                            else:
-                                self.stats["errors_task_deletion"] += 1; overall_sync_successful=False
-                            self.stats["tasks_skipped_completed_of"] += 1 # Still count as processed completed OF task
-                            continue # Move to next OF task
+        for mapping in tasks_to_check:
+            motion_id = mapping.get('motion_id')
 
-                        if of_task.completed:
-                            self.stats["tasks_skipped_completed_of"] += 1
-                            continue
+            # Fetch individual task status from Motion API
+            task_data = MotionSync._make_request("GET", f"tasks/{motion_id}")
+            if not task_data:
+                continue
 
-                        # Task is NOT completed in OF. Process for creation if new/modified.
-                        if not self.last_sync_timestamp or motion_project_was_created_this_run or task_is_new_or_modified_in_of:
-                            if motion_task_data: # Task with same name exists in Motion
-                                self.stats["tasks_matched"] += 1
-                                # print(f"         Task '{task_name}' already exists in Motion and OF task not marked for completion-deletion. Skipping creation.")
-                                continue
-                            
-                            # Task does not exist in Motion, proceed to create
-                            if self.config.create_missing_tasks:
-                                print(f"         ✨ Creating Motion task for '{task_name}'" +
-                                      (" (new/modified in OF)" if task_is_new_or_modified_in_of and not motion_project_was_created_this_run else "") +
-                                      (" (Motion project new)" if motion_project_was_created_this_run else "")
+            is_completed = task_data.get('completed', False)
+            if not is_completed:
+                time.sleep(self.config.api_rate_limit_delay)
+                continue
+
+            # Update local data to reflect completion
+            ws_name = mapping.get('workspace', '')
+            proj_name = mapping.get('project', '')
+            task_name = mapping.get('task_name', '')
+
+            proj_tasks = motion_data.get('workspaces', {}).get(ws_name, {}).get('projects', {}).get(proj_name, {}).get('tasks', {})
+            if task_name in proj_tasks:
+                proj_tasks[task_name]['status'] = {'name': 'Completed', 'isResolvedStatus': True}
+                proj_tasks[task_name]['completed'] = True
+                proj_tasks[task_name]['completedTime'] = task_data.get('completedTime')
+                completed_count += 1
+                print(f"   ✅ Detected completion: '{task_name}'")
+
+            time.sleep(self.config.api_rate_limit_delay)
+
+        print(f"   📊 Found {completed_count} newly completed task(s) in Motion")
+        if completed_count > 0:
+            self.save_motion_data_to_file(motion_data, update_timestamp=False)
+        return motion_data
+
+    def refresh_motion_tasks_from_api(self, motion_data: Dict) -> Dict:
+        """Fetch current tasks from Motion API and merge new ones into local data.
+
+        This discovers tasks created directly in Motion that aren't in the local
+        JSON file yet. Without this, Motion-only tasks are invisible to reverse sync.
+        """
+        print("🔄 Refreshing Motion tasks from API to discover new tasks...")
+        new_task_count = 0
+
+        for ws_name, ws_data in motion_data.get('workspaces', {}).items():
+            ws_id = ws_data.get('id')
+            if not ws_id:
+                continue
+
+            for proj_name, proj_data in ws_data.get('projects', {}).items():
+                proj_id = proj_data.get('id')
+                if not proj_id:
+                    continue
+
+                # Fetch current tasks from Motion API for this project
+                api_tasks = self.get_tasks_for_project(proj_id, proj_name)
+                local_tasks = proj_data.get('tasks', {})
+
+                # Merge any new tasks that aren't in local data
+                for task_name, task_data in api_tasks.items():
+                    if task_name not in local_tasks:
+                        local_tasks[task_name] = task_data
+                        new_task_count += 1
+
+                proj_data['tasks'] = local_tasks
+                time.sleep(self.config.api_rate_limit_delay)
+
+        if new_task_count > 0:
+            print(f"   📊 Discovered {new_task_count} new task(s) from Motion API")
+            self.save_motion_data_to_file(motion_data, update_timestamp=False)
+        else:
+            print("   📊 No new tasks found in Motion")
+
+        return motion_data
+
+    def sync_motion_to_omnifocus(self):
+        """Sync Motion changes back to OmniFocus (reverse sync)."""
+        print("\n🔄 Starting Motion → OmniFocus synchronization...")
+
+        # Refresh from Motion API to pick up changes and new tasks
+        motion_data = self.load_motion_data_from_file()
+        motion_data = self.refresh_motion_tasks_from_api(motion_data)
+        motion_data = self.refresh_motion_task_statuses(motion_data)
+
+        # Reuse OF structure loaded at start of bidirectional sync
+        if not self.of_structure:
+            self.of_structure = self.load_omnifocus_structure()
+        if not self.of_structure:
+            print("❌ Failed to load OmniFocus structure. Cannot proceed with reverse sync.")
+            return
+
+        # Create reverse sync plan (may add auto-mappings to id_mapper)
+        reverse_sync_plan = self.create_reverse_sync_plan(motion_data, self.of_structure)
+
+        # Execute reverse sync, passing motion_data to avoid re-loading (which discards auto-mappings)
+        self.execute_reverse_sync_plan(reverse_sync_plan, motion_data)
+
+        print("✅ Reverse synchronization completed!")
+    
+    def create_reverse_sync_plan(self, motion_data: Dict, of_structure: List[OFFolder]) -> Dict:
+        """
+        Create a plan for syncing Motion → OmniFocus.
+        Handles completions and new task creation.
+        """
+        print("📋 Creating reverse sync plan (Motion → OmniFocus)...")
+
+        # Build reverse workspace mapping (Motion workspace → OF folder)
+        reverse_ws_mapping = {v: k for k, v in self.workspace_mapping.items()}
+
+        reverse_sync_plan = {
+            'of_tasks_to_complete': [],
+            'of_tasks_to_update': [],
+            'of_tasks_to_create': []
+        }
+
+        # Create lookup maps of OmniFocus tasks
+        of_tasks_by_id = {}
+        of_tasks_by_project_and_name = {}  # (project_name, task_name) → OFTask
+        of_projects_by_folder = {}
+        for folder in of_structure:
+            of_projects_by_folder[folder.name] = {p.name for p in folder.projects}
+            for project in folder.projects:
+                for task in project.tasks:
+                    of_tasks_by_id[task.id] = task
+                    of_tasks_by_project_and_name[(project.name, task.name.strip())] = task
+
+        # Iterate through Motion workspaces
+        for ws_name, ws_data in motion_data.get('workspaces', {}).items():
+            for proj_name, proj_data in ws_data.get('projects', {}).items():
+                for task_name, motion_task in proj_data.get('tasks', {}).items():
+
+                    motion_id = motion_task.get('id')
+                    if not motion_id:
+                        continue
+
+                    # Skip completed Motion tasks for creation (only sync completions)
+                    motion_status = (motion_task.get('status') or {}).get('name', '').lower()
+                    motion_completed = motion_status == 'completed'
+
+                    # Use ID mapper to find corresponding OmniFocus task
+                    of_id = self.id_mapper.get_of_id_from_motion(motion_id) if self.id_mapper else None
+
+                    if not of_id:
+                        # No mapping exists - check if task already exists in OF by name
+                        existing_of_task = of_tasks_by_project_and_name.get((proj_name, task_name))
+                        if existing_of_task:
+                            # Task already exists in OF - create the mapping, don't duplicate
+                            if self.id_mapper:
+                                self.id_mapper.add_mapping(
+                                    of_id=existing_of_task.id,
+                                    motion_id=motion_id,
+                                    workspace=ws_name,
+                                    project=proj_name,
+                                    task_name=task_name
                                 )
-                                
-                                schedule_name_to_pass = None
-                                target_schedule_name_from_map = WORKSPACE_TO_SCHEDULE_MAP.get(folder_name)
-                                if target_schedule_name_from_map:
-                                    if target_schedule_name_from_map in self.motion_schedule_names:
-                                        schedule_name_to_pass = target_schedule_name_from_map
-                                    else:
-                                        print(f"         ⚠️ Warn: Schedule name '{target_schedule_name_from_map}' (mapped for workspace '{folder_name}') not found in verified Motion schedule names. Task will use Motion default scheduling.")
-                                        self.stats["schedule_mapping_warnings"]+=1
-                                
-                                task_priority = "HIGH" if of_task.flagged else "MEDIUM"
-                                
-                                created_task = MotionSync.create_task_in_project(
-                                    proj_id, ws_id, task_name, of_task.note, of_task.url,
-                                    of_task.due_date, of_task.duration_minutes,
-                                    schedule_name_to_pass, priority=task_priority)
-                                if created_task:
-                                    self.stats["tasks_created"] += 1
-                                    if of_task.due_date: self.stats["tasks_created_with_due_date"] += 1
-                                    if of_task.duration_minutes: self.stats["tasks_created_with_duration"] += 1
-                                    if schedule_name_to_pass: self.stats["tasks_created_with_schedule"] += 1
-                                    if task_priority == "HIGH": self.stats["tasks_created_with_high_priority"] +=1
-                                    else: self.stats["tasks_created_with_medium_priority"] +=1
+                                print(f"   📎 Auto-mapped existing: '{task_name}' OF:{existing_of_task.id[:8]}... → Motion:{motion_id[:8]}...")
 
-                                    if SYNC_MODE != "dry_run" and created_task.get('id'):
-                                        # Add newly created task to local cache
-                                        motion_tasks_in_proj_for_this_project[created_task['name']] = MotionTask(
-                                            id=created_task['id'], name=created_task['name'], projectId=proj_id, workspaceId=ws_id,
-                                            description=created_task.get('description'), dueDate=created_task.get('dueDate'),
-                                            duration=created_task.get('duration'), schedule=created_task.get("schedule"),
-                                            priority=created_task.get("priority")
-                                            # Assuming new tasks don't have status info immediately available from create response in same detail
-                                        )
-                                else: print(f"         ❌ Fail create task '{task_name}'."); self.stats["errors_task_creation"] += 1; overall_sync_successful=False
-                            else:
-                                target_schedule_name_for_report = WORKSPACE_TO_SCHEDULE_MAP.get(folder_name)
-                                sched_name_for_report = "Motion Default"
-                                if target_schedule_name_for_report:
-                                    sched_name_for_report = target_schedule_name_for_report
-                                    if target_schedule_name_for_report not in self.motion_schedule_names:
-                                        sched_name_for_report += " (NOT VERIFIED in Motion)"
-                                sched_info_dr = f" (Schedule: {sched_name_for_report})"
-                                priority_info_dr = " (Priority: HIGH)" if of_task.flagged else " (Priority: MEDIUM)"
-                                due_info = f" (Due: {of_task.due_date})" if of_task.due_date else ""
-                                dur_info = f" (Dur: {of_task.duration_minutes}m)" if of_task.duration_minutes else ""
-                                
-                                print(f"         [{SYNC_MODE.upper()}] Would create task '{task_name}'{due_info}{dur_info}{sched_info_dr}{priority_info_dr}.")
-                        else:
-                            print(f"         ⏭️ Skipping OF Task '{task_name}' (not modified since last sync: {self.last_sync_timestamp} and Motion project not new).")
-                            self.stats["tasks_skipped_not_modified"] += 1
-                            continue
-        except Exception as e:
-            print(f"🚨 UNEXPECTED ERROR during synchronization: {e}")
-            traceback.print_exc()
-            overall_sync_successful = False
-        finally:
-            print("\n--- Synchronization Summary ---"); print(f"Sync Mode: {SYNC_MODE.upper()}")
-            for k, v in self.stats.items():
-                if v > 0: print(f"  {k.replace('_', ' ').replace(' Of ', ' OF ').title()}: {v}")
-            total_err = sum(self.stats[e] for e in ["errors_workspace_creation", "errors_project_creation", "errors_task_creation", "errors_task_deletion", "get_tasks_api_errors"])
-            if total_err == 0 and self.stats["schedule_mapping_warnings"] == 0: print("  No errors or warnings.")
+                            # Check completion sync for this newly-mapped pair
+                            if motion_completed and not existing_of_task.completed:
+                                reverse_sync_plan['of_tasks_to_complete'].append({
+                                    'of_id': existing_of_task.id,
+                                    'motion_id': motion_id,
+                                    'task_name': task_name,
+                                    'workspace': ws_name,
+                                    'project': proj_name
+                                })
+                        elif not motion_completed:
+                            # Truly new Motion-only task → create in OmniFocus
+                            of_folder = reverse_ws_mapping.get(ws_name, ws_name)
+                            if proj_name in of_projects_by_folder.get(of_folder, set()):
+                                reverse_sync_plan['of_tasks_to_create'].append({
+                                    'motion_id': motion_id,
+                                    'task_name': task_name,
+                                    'workspace': ws_name,
+                                    'project': proj_name,
+                                    'description': motion_task.get('description', ''),
+                                    'due_date': motion_task.get('dueDate'),
+                                    'priority': motion_task.get('priority', 'MEDIUM'),
+                                    'duration': motion_task.get('duration'),
+                                })
+                        continue
+
+                    # Get the actual OmniFocus task
+                    of_task = of_tasks_by_id.get(of_id)
+
+                    if not of_task:
+                        # Mapping exists but task not found in OmniFocus (maybe deleted)
+                        continue
+
+                    # Check if Motion task is completed but OmniFocus task isn't
+                    if motion_completed and not of_task.completed:
+                        reverse_sync_plan['of_tasks_to_complete'].append({
+                            'of_id': of_id,
+                            'motion_id': motion_id,
+                            'task_name': task_name,
+                            'workspace': ws_name,
+                            'project': proj_name
+                        })
+
+        print(f"   📊 Tasks to complete in OmniFocus: {len(reverse_sync_plan['of_tasks_to_complete'])}")
+        print(f"   📊 Tasks to create in OmniFocus: {len(reverse_sync_plan['of_tasks_to_create'])}")
+        return reverse_sync_plan
+    
+    def execute_reverse_sync_plan(self, reverse_sync_plan: Dict, motion_data: Optional[Dict] = None) -> bool:
+        """Execute Motion → OmniFocus sync plan."""
+        print("⚡ Executing reverse sync plan...")
+
+        completed_count = 0
+        created_count = 0
+        failed_count = 0
+
+        # Use passed motion_data to preserve auto-mappings and refreshed statuses
+        if motion_data is None:
+            motion_data = self.load_motion_data_from_file()
+
+        # Complete tasks
+        for task_data in reverse_sync_plan['of_tasks_to_complete']:
+            task_name = task_data['task_name']
+            of_id = task_data['of_id']
+
+            print(f"   🔄 Completing OF task: '{task_name}'...")
+
+            success = OmniFocusManager.complete_task(of_id)
+
+            if success:
+                completed_count += 1
+                print(f"      ✅ Completed in OmniFocus")
             else:
-                if total_err > 0: print(f"  Total Errors Encountered: {total_err}")
-                if self.stats["schedule_mapping_warnings"] > 0: print(f"  Schedule Mapping Warnings: {self.stats['schedule_mapping_warnings']}")
+                failed_count += 1
+
+        # Create new tasks in OmniFocus
+        for task_data in reverse_sync_plan['of_tasks_to_create']:
+            task_name = task_data['task_name']
+            proj_name = task_data['project']
+            motion_id = task_data['motion_id']
+            ws_name = task_data['workspace']
+
+            print(f"   ➕ Creating OF task: '{task_name}' in '{proj_name}'...")
+
+            # Build note with Motion link
+            ws_id = motion_data.get('workspaces', {}).get(ws_name, {}).get('id', '')
+            proj_id = motion_data.get('workspaces', {}).get(ws_name, {}).get('projects', {}).get(proj_name, {}).get('id', '')
+            motion_url = f"https://app.usemotion.com/web/pm/workspaces/{ws_id}/projects/{proj_id}/views/default?task={motion_id}"
+
+            desc_body = strip_html(extract_body(task_data.get('description', '') or ''))
+            note = build_description(body=desc_body, motion_url=motion_url)
+
+            # Map Motion priority to OF flagged
+            flagged = task_data.get('priority') == 'ASAP'
+
+            # Normalize due_date to YYYY-MM-DD (Motion returns full ISO datetime)
+            raw_due = task_data.get('due_date') or ''
+            of_due_date = raw_due[:10] if raw_due else None
+
+            new_of_id = OmniFocusManager.create_task(
+                project_name=proj_name,
+                task_name=task_name,
+                note=note,
+                due_date=of_due_date,
+                flagged=flagged,
+                estimated_minutes=task_data.get('duration')
+            )
+
+            if new_of_id:
+                created_count += 1
+                print(f"      ✅ Created in OmniFocus (ID: {new_of_id[:8]}...)")
+
+                # Store bidirectional mapping
+                if self.id_mapper:
+                    self.id_mapper.add_mapping(
+                        of_id=new_of_id,
+                        motion_id=motion_id,
+                        workspace=ws_name,
+                        project=proj_name,
+                        task_name=task_name
+                    )
+
+                # Add OF link to Motion task description
+                motion_task = self._find_motion_task_in_data(motion_data, motion_id)
+                if motion_task:
+                    desc = motion_task.get('description', '') or ''
+                    of_url = f"omnifocus:///task/{new_of_id}"
+                    if 'omnifocus:///' not in desc.lower():
+                        body = extract_body(desc)
+                        new_desc = build_description(body=body, of_url=of_url)
+                        MotionSync.update_task(motion_id, {'description': new_desc})
+                        time.sleep(self.config.api_rate_limit_delay)
+            else:
+                failed_count += 1
+
+        # Always save - auto-mappings from create_reverse_sync_plan need persisting
+        has_changes = created_count > 0 or completed_count > 0
+        self.save_motion_data_to_file(motion_data, update_timestamp=has_changes)
+
+        print(f"\n📊 Reverse Sync Results:")
+        print(f"   ✅ Completed: {completed_count}")
+        print(f"   ➕ Created: {created_count}")
+        print(f"   ❌ Failed: {failed_count}")
+
+        return failed_count == 0
+
+    def perform_sync_comparison_from_structure(self, motion_data: Dict):
+        """Perform sync comparison using the loaded OmniFocus structure."""
+        print("🔍 Performing sync comparison from OF structure...")
+        try:
+            sync_plan = self.create_sync_plan_from_structure(motion_data)
+            self.execute_sync_plan(sync_plan, motion_data)
+        except Exception as e:
+            print(f"❌ Error during sync comparison: {e}")
+            traceback.print_exc()
+
+    def create_sync_plan_from_structure(self, motion_data: Dict) -> Dict:
+        """Create a sync plan by comparing individual task modification times."""
+        print(" Creating sync plan from OF structure...")
+        self.last_sync_timestamp = motion_data.get("metadata", {}).get("last_sync_timestamp")
+        if self.last_sync_timestamp:
+            print(f"ℹ️  Comparing against last sync time: {self.last_sync_timestamp}")
+
+        # Use ignored folders from config
+        ignore_folders = self.ignored_folders
+        sync_plan = {
+            'workspaces_to_create': [], 'projects_to_create': [], 'tasks_to_create': [],
+            'tasks_to_update': [], 'tasks_to_complete': []
+        }
+        motion_workspaces = motion_data.get('workspaces', {})
+
+        for folder in self.of_structure:
+            folder_name = folder.name.strip()
+            if folder_name in ignore_folders: continue
+
+            # ✅ Map OmniFocus folder to Motion workspace (or use same name)
+            motion_workspace_name = self.workspace_mapping.get(folder_name, folder_name)
+
+            if motion_workspace_name not in motion_workspaces:
+                print(f"⚠️  Warning: No Motion workspace found for OF folder '{folder_name}'")
+                print(f"   → Tried to find: '{motion_workspace_name}'")
+                print(f"   → Run 'python3 list_motion_workspaces.py' and update workspace_mapping")
+                sync_plan['workspaces_to_create'].append(folder_name)
+                continue
             
-            if overall_sync_successful and SYNC_MODE == 'sync':
-                current_utc_timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds') + "Z"
-                self._save_last_sync_timestamp(current_utc_timestamp)
-            elif SYNC_MODE == 'sync':
-                print("⚠️ Sync was not fully successful or an error occurred. Last sync timestamp NOT updated.")
+            workspace_projects = motion_workspaces[motion_workspace_name].get('projects', {})
 
-            print("\n✅ Sync Process Complete!")
+            for project in folder.projects:
+                project_name = project.name.strip()
 
+                if project_name not in workspace_projects:
+                    if not project.completed:
+                        sync_plan['projects_to_create'].append({
+                            'name': project_name, 
+                            'workspace': folder_name,  # Original OF folder name
+                            'motion_workspace': motion_workspace_name  # Mapped Motion workspace
+                        })
+                    continue
+
+                project_tasks = workspace_projects[project_name].get('tasks', {})
+                for task in project.tasks:
+                    task_name = task.name.strip()
+                    motion_task_exists = task_name in project_tasks
+
+                    if motion_task_exists:
+                        motion_task = project_tasks[task_name]
+                        is_completed_in_motion = (motion_task.get('status') or {}).get('name', '').lower() == 'completed'
+
+                        if task.completed and not is_completed_in_motion:
+                            # Deduplicate: skip if this Motion task ID is already queued for completion
+                            motion_id = motion_task['id']
+                            already_queued = any(t['motion_task_id'] == motion_id for t in sync_plan['tasks_to_complete'])
+                            if not already_queued:
+                                sync_plan['tasks_to_complete'].append({
+                                    'motion_task_id': motion_id,
+                                    'name': task_name,
+                                    'workspace': motion_workspace_name,
+                                    'project': project_name
+                                })
+                        
+                        elif not task.completed:
+                            of_mod_time = task.of_modification_date
+
+                            # Only check for updates if OF task was modified after last sync
+                            if (not self.last_sync_timestamp) or (of_mod_time and of_mod_time > self.last_sync_timestamp):
+                                self._check_task_for_updates(task, motion_task, sync_plan, project_name, motion_workspace_name)
+
+                    elif not task.completed:
+                        sync_plan['tasks_to_create'].append({
+                            'name': task_name, 'project': project_name, 'workspace': folder_name,
+                            'of_id': task.id,  # ✅ Include OmniFocus ID for mapping
+                            'due_date': getattr(task, 'due_date', None),
+                            'defer_date': getattr(task, 'defer_date', None),  # ✅ NEW: Start date
+                            'duration_minutes': getattr(task, 'duration_minutes', None),
+                            'flagged': getattr(task, 'flagged', False),
+                            'of_priority': getattr(task, 'of_priority', None),  # ✅ NEW: Priority tag
+                            'note': getattr(task, 'note', None),
+                            'url': getattr(task, 'url', None),
+                            'contexts': getattr(task, 'contexts', []),  # ✅ NEW: Tags
+                            'repeat_rule': getattr(task, 'repeat_rule', None)  # ✅ NEW: Recurrence
+                        })
+
+        print(f"\n📋 Sync Plan Summary:")
+        for key, value in sync_plan.items(): print(f"   {key.replace('_', ' ').title()}: {len(value)}")
+        return sync_plan
+    
+    def _check_task_for_updates(self, of_task: OFTask, motion_task: Dict, sync_plan: Dict, project_name: str, workspace_name: str):
+        """Check if an existing ACTIVE Motion task needs updates based on OmniFocus data."""
+        updates_needed, field_changes = {}, []
+
+        # Due date: normalize both to YYYY-MM-DD
+        of_due_date = getattr(of_task, 'due_date', None) or ""
+        motion_due = (motion_task.get('dueDate') or "")[:10]
+        if of_due_date != motion_due:
+            updates_needed['dueDate'] = of_due_date or None
+            field_changes.append("due date")
+
+        # Duration: normalize None/0/"NONE" to comparable values
+        of_duration = getattr(of_task, 'duration_minutes', None)
+        motion_duration = motion_task.get('duration')
+        # Treat None, 0, and "NONE" as equivalent (no duration set)
+        of_dur_normalized = of_duration if of_duration and of_duration != "NONE" else None
+        motion_dur_normalized = motion_duration if motion_duration and motion_duration != "NONE" else None
+        if of_dur_normalized != motion_dur_normalized:
+            updates_needed['duration'] = of_dur_normalized
+            field_changes.append("duration")
+
+        # Priority
+        of_priority = self.map_of_priority_to_motion(of_task)
+        motion_priority = (motion_task.get('priority') or "MEDIUM").upper()
+        if of_priority != motion_priority:
+            updates_needed['priority'] = of_priority
+            field_changes.append("priority")
+
+        # Description: compare body only (strip metadata from both sides)
+        of_note_body = extract_body(getattr(of_task, 'note', None) or '')
+        motion_desc_body = extract_body(motion_task.get('description', '') or '')
+        if of_note_body != motion_desc_body:
+            of_tags = getattr(of_task, 'contexts', []) or []
+            of_url = getattr(of_task, 'url', None)
+            updates_needed['description'] = build_description(
+                body=of_note_body, tags=of_tags if of_tags else None, of_url=of_url
+            )
+            field_changes.append("description")
+
+        if updates_needed:
+            task_name = motion_task.get('name', 'Unknown Task')
+            print(f"   ↪️  Planning update for '{task_name}' ({', '.join(field_changes)})")
+            sync_plan['tasks_to_update'].append({
+                'motion_task_id': motion_task['id'], 
+                'name': task_name, 
+                'updates': updates_needed,
+                'workspace': workspace_name,
+                'project': project_name
+            })
+
+    def execute_sync_plan(self, sync_plan: Dict, motion_data: Dict) -> bool:
+        """Execute the sync plan by creating/updating items in Motion."""
+        print("⚡ Executing sync plan...")
+        try:
+            # ❌ REMOVED: Motion API doesn't support creating workspaces
+            # Workspaces must be created manually in Motion UI
+            for workspace_name in sync_plan['workspaces_to_create']:
+                print(f"⚠️  Workspace '{workspace_name}' doesn't exist in Motion.")
+                print(f"   → Please create it manually in Motion, or map it to an existing workspace.")
+                # Skip creating projects for non-existent workspaces
+                continue
+            
+            for project_data in sync_plan['projects_to_create']:
+                project_name = project_data['name']
+                of_folder_name = project_data['workspace']  # Original OmniFocus folder name
+                motion_workspace_name = project_data.get('motion_workspace', of_folder_name)  # Mapped Motion workspace
+                
+                if motion_workspace_name in motion_data['workspaces']:
+                    workspace_id = motion_data['workspaces'][motion_workspace_name]['id']
+                    created_proj = MotionSync.create_project_in_workspace(workspace_id, project_name)
+                    if created_proj and created_proj.get('id'):
+                        # Store under Motion workspace name
+                        motion_data['workspaces'][motion_workspace_name]['projects'][project_name] = {'id': created_proj['id'], 'tasks': {}}
+                        print(f"   ✅ Created project '{project_name}' in Motion workspace '{motion_workspace_name}'")
+                else:
+                    print(f"   ⚠️  Skipping project '{project_name}' - workspace '{motion_workspace_name}' not found")
+
+            for task_data in sync_plan['tasks_to_create']:
+                task_name = task_data['name']
+                project_name = task_data['project']
+                of_folder_name = task_data['workspace']  # Original OmniFocus folder
+                
+                # Map to Motion workspace
+                motion_workspace_name = self.workspace_mapping.get(of_folder_name, of_folder_name)
+                
+                if motion_workspace_name in motion_data['workspaces'] and project_name in motion_data['workspaces'][motion_workspace_name]['projects']:
+                    project_id = motion_data['workspaces'][motion_workspace_name]['projects'][project_name]['id']
+                    
+                    # ✅ Get OmniFocus task ID for mapping
+                    of_task_id = task_data.get('of_id')
+                    
+                    created_task = self._create_task(task_name, project_id, task_data, motion_data, motion_workspace_name)
+                    if created_task:
+                        motion_data['workspaces'][motion_workspace_name]['projects'][project_name]['tasks'][task_name] = created_task
+                        
+                        # ✅ Store bidirectional ID mapping
+                        if of_task_id and created_task.get('id') and self.id_mapper:
+                            self.id_mapper.add_mapping(
+                                of_id=of_task_id,
+                                motion_id=created_task['id'],
+                                workspace=motion_workspace_name,  # Use Motion workspace name
+                                project=project_name,
+                                task_name=task_name
+                            )
+                            print(f"      📎 Mapped OF:{of_task_id[:8]}... → Motion:{created_task['id'][:8]}...")
+
+                            # Write Motion link back to OmniFocus notes
+                            workspace_id = motion_data['workspaces'][motion_workspace_name]['id']
+                            motion_url = f"https://app.usemotion.com/web/pm/workspaces/{workspace_id}/projects/{project_id}/views/default?task={created_task['id']}"
+                            of_note_body = extract_body(task_data.get('note', '') or '')
+                            new_note = build_description(
+                                body=of_note_body,
+                                motion_url=motion_url
+                            )
+                            OmniFocusManager.update_task(of_task_id, {'note': new_note})
+
+            for task_data in sync_plan['tasks_to_update']:
+                updated_task_response = MotionSync.update_task(task_data['motion_task_id'], task_data['updates'])
+                if updated_task_response:
+                    workspace_name = task_data['workspace']
+                    project_name = task_data['project']
+                    task_name = task_data['name']
+                    if workspace_name in motion_data['workspaces'] and project_name in motion_data['workspaces'][workspace_name]['projects']:
+                        motion_data['workspaces'][workspace_name]['projects'][project_name]['tasks'][task_name] = updated_task_response
+
+            for task_data in sync_plan['tasks_to_complete']:
+                success = MotionSync.complete_task(task_data['motion_task_id'])
+                if success:
+                    workspace_name = task_data['workspace']
+                    project_name = task_data['project']
+                    task_name = task_data['name']
+                    if workspace_name in motion_data['workspaces'] and \
+                       project_name in motion_data['workspaces'][workspace_name]['projects'] and \
+                       task_name in motion_data['workspaces'][workspace_name]['projects'][project_name]['tasks']:
+                        
+                        motion_data['workspaces'][workspace_name]['projects'][project_name]['tasks'][task_name]['status'] = {'name': 'Completed', 'isResolvedStatus': True}
+                        motion_data['workspaces'][workspace_name]['projects'][project_name]['tasks'][task_name]['updatedTime'] = datetime.now(timezone.utc).isoformat()
+
+            # Backfill Motion URLs into OF notes for mapped tasks missing them
+            self._backfill_missing_cross_links(motion_data)
+
+            self.save_motion_data_to_file(motion_data, update_timestamp=True)
+            print("✅ Sync plan execution completed")
+            return True
+        except Exception as e:
+            print(f"❌ Error executing sync plan: {e}")
+            traceback.print_exc()
+            return False
+
+    def _create_task(self, name: str, project_id: str, task_data: Dict, motion_data: Dict, motion_workspace_name: str) -> Optional[Dict]:
+        """Create a task in Motion and return the full task object."""
+        workspace_id = motion_data['workspaces'][motion_workspace_name]['id']
+        schedule_name = self.workspace_schedule_mapping.get(motion_workspace_name)
+        
+        # ✅ NEW: Determine priority from OF task data
+        # Create a temp OFTask object to use priority mapping function
+        temp_task = OFTask(
+            id="", name="", 
+            flagged=task_data.get('flagged', False),
+            of_priority=task_data.get('of_priority')
+        )
+        motion_priority = self.map_of_priority_to_motion(temp_task)
+        
+        result = MotionSync.create_task_in_project(
+            project_id=project_id, workspace_id=workspace_id, task_name=name,
+            description=task_data.get('note'), of_task_url=task_data.get('url'),
+            due_date_str=task_data.get('due_date'),
+            defer_date_str=task_data.get('defer_date'),  # ✅ NEW: Start date
+            task_duration=task_data.get('duration_minutes'),
+            schedule_name_to_use=schedule_name,
+            priority=motion_priority,  # ✅ NEW: Use proper priority mapping
+            labels=task_data.get('contexts', [])  # ✅ NEW: Tags/contexts
+        )
+        return result if result and result.get('id') else None
+
+    def _find_motion_task_in_data(self, motion_data: Dict, motion_id: str) -> Optional[Dict]:
+        """Find a Motion task by ID in the nested data structure."""
+        for ws_data in motion_data.get('workspaces', {}).values():
+            for proj_data in ws_data.get('projects', {}).values():
+                for task_data in proj_data.get('tasks', {}).values():
+                    if task_data.get('id') == motion_id:
+                        return task_data
+        return None
+
+    def _backfill_missing_cross_links(self, motion_data: Dict):
+        """Add Motion URLs to OF notes for mapped tasks that are missing them.
+
+        Runs during normal sync to ensure all mapped tasks have cross-links,
+        not just newly created ones.
+        """
+        if not self.id_mapper:
+            return
+
+        mappings = self.id_mapper.state_data.get('task_mappings', {})
+        if not mappings:
+            return
+
+        # Build lookup dict for O(1) access by task ID
+        of_tasks_by_id = {}
+        if self.of_structure:
+            for folder in self.of_structure:
+                for project in folder.projects:
+                    for task in project.tasks:
+                        of_tasks_by_id[task.id] = task
+
+        of_updated = 0
+
+        for mapping in mappings.values():
+            of_id = mapping.get('of_id')
+            motion_id = mapping.get('motion_id')
+            if not of_id or not motion_id:
+                continue
+
+            ws_name = mapping.get('workspace', '')
+            proj_name = mapping.get('project', '')
+
+            of_task = of_tasks_by_id.get(of_id)
+
+            if not of_task:
+                continue
+
+            note = of_task.note or ''
+            if 'app.usemotion.com' in note:
+                continue  # Already has Motion URL
+
+            # Build and write the Motion URL
+            ws_id = motion_data.get('workspaces', {}).get(ws_name, {}).get('id', '')
+            proj_id = motion_data.get('workspaces', {}).get(ws_name, {}).get('projects', {}).get(proj_name, {}).get('id', '')
+            if not ws_id or not proj_id:
+                continue
+
+            motion_url = f"https://app.usemotion.com/web/pm/workspaces/{ws_id}/projects/{proj_id}/views/default?task={motion_id}"
+            body = extract_body(note)
+            new_note = build_description(body=body, motion_url=motion_url)
+            if OmniFocusManager.update_task(of_id, {'note': new_note}):
+                of_updated += 1
+
+        if of_updated > 0:
+            print(f"   🔗 Added Motion URLs to {of_updated} OF task note(s)")
+
+    def backfill_cross_links(self):
+        """Backfill cross-reference links between OmniFocus and Motion tasks."""
+        motion_data = self.load_motion_data_from_file()
+
+        mappings = self.id_mapper.state_data.get('task_mappings', {}) if self.id_mapper else {}
+        if not mappings:
+            print("ℹ️  No task mappings found. Skipping cross-link backfill.")
+            return
+
+        print(f"\n🔗 Backfilling cross-links for {len(mappings)} mapped tasks...")
+
+        # Reuse OF structure if already loaded
+        of_structure = self.of_structure or self.load_omnifocus_structure()
+        of_tasks_by_id = {}
+        for folder in of_structure:
+            for project in folder.projects:
+                for task in project.tasks:
+                    of_tasks_by_id[task.id] = task
+
+        motion_updated = 0
+        of_updated = 0
+
+        for mapping in mappings.values():
+            of_id = mapping.get('of_id')
+            motion_id = mapping.get('motion_id')
+            if not of_id or not motion_id:
+                continue
+
+            ws_name = mapping.get('workspace', '')
+            proj_name = mapping.get('project', '')
+            ws_id = motion_data.get('workspaces', {}).get(ws_name, {}).get('id', '')
+            proj_id = motion_data.get('workspaces', {}).get(ws_name, {}).get('projects', {}).get(proj_name, {}).get('id', '')
+
+            # 1. Add OF link to Motion task description if missing
+            motion_task = self._find_motion_task_in_data(motion_data, motion_id)
+            if motion_task:
+                desc = motion_task.get('description', '') or ''
+                if 'omnifocus:///' not in desc.lower():
+                    of_url = f"omnifocus:///task/{of_id}"
+                    body = extract_body(desc)
+                    new_desc = build_description(body=body, of_url=of_url)
+                    result = MotionSync.update_task(motion_id, {'description': new_desc})
+                    if result:
+                        motion_updated += 1
+                    time.sleep(self.config.api_rate_limit_delay)
+
+            # 2. Add Motion link to OF task note if missing
+            of_task = of_tasks_by_id.get(of_id)
+            if of_task:
+                note = of_task.note or ''
+                if 'app.usemotion.com' not in note:
+                    motion_url = f"https://app.usemotion.com/web/pm/workspaces/{ws_id}/projects/{proj_id}/views/default?task={motion_id}"
+                    body = extract_body(note)
+                    new_note = build_description(body=body, motion_url=motion_url)
+                    OmniFocusManager.update_task(of_id, {'note': new_note})
+                    of_updated += 1
+
+        print(f"🔗 Cross-link backfill complete: {motion_updated} Motion tasks, {of_updated} OF tasks updated")
+
+    def log_workspace_schedule_info(self):
+        """Log workspace schedule mapping for reference."""
+        print(" M-> Workspace Schedule Mapping (for reference):")
+        for workspace, schedule in self.workspace_schedule_mapping.items():
+            print(f"    • {workspace} → {schedule}")
+        print(" M-> Note: Motion automatically assigns workspace schedules to new items")
+
+    def run_workflow(self, refresh_mapping: bool = False, sync_only: bool = False):
+        """Main workflow that combines mapping and sync."""
+        print("🚀 OmniFocus to Motion Hybrid Sync")
+        print("=" * 50)
+        
+        if refresh_mapping or not self.check_local_data_exists():
+            print("📊 Creating/Refreshing Motion data mapping...")
+            self.create_comprehensive_mapping()
+        
+        self.log_workspace_schedule_info()
+        
+        if not sync_only:
+            print("🔄 Starting synchronization...")
+            self.sync_omnifocus_to_motion()
+        
+        print("✅ Workflow completed successfully!")
+    
+    def run_bidirectional_sync(self, refresh_mapping: bool = False):
+        """
+        Execute full bidirectional synchronization.
+        Loads OmniFocus structure once and shares it across all phases.
+        Phase 1: OmniFocus → Motion
+        Phase 2: Motion → OmniFocus
+        """
+        print("🚀 OmniFocus ↔ Motion Bidirectional Sync")
+        print("=" * 50)
+
+        if refresh_mapping or not self.check_local_data_exists():
+            print("📊 Creating/Refreshing Motion data mapping...")
+            self.create_comprehensive_mapping()
+
+        # Load OmniFocus structure once for the entire sync
+        self.of_structure = self.load_omnifocus_structure()
+        if not self.of_structure:
+            print("❌ Failed to load OmniFocus structure. Cannot proceed.")
+            return
+
+        if refresh_mapping:
+            print("\n" + "=" * 50)
+            print("Phase 0: Backfill Cross-Links")
+            print("=" * 50)
+            self.backfill_cross_links()
+
+        self.log_workspace_schedule_info()
+
+        print("\n" + "=" * 50)
+        print("Phase 1: OmniFocus → Motion")
+        print("=" * 50)
+        self.sync_omnifocus_to_motion()
+
+        print("\n" + "=" * 50)
+        print("Phase 2: Motion → OmniFocus")
+        print("=" * 50)
+        self.sync_motion_to_omnifocus()
+
+        print("\n✅ Bidirectional sync completed successfully!")
 
 def main():
-    config = SyncConfig(create_missing_workspaces=(SYNC_MODE == 'sync'), create_missing_projects=(SYNC_MODE == 'sync'),
-                        create_missing_tasks=(SYNC_MODE == 'sync'), strict_matching=(SYNC_MODE == 'strict'), skip_folders=SKIP_FOLDERS)
-    ProjectSynchronizer(config).sync()
+    """Main function with command line options."""
+    # Initialize the lock immediately at startup
+    lock_handle = acquire_lock()
+    
+    
+    parser = argparse.ArgumentParser(description="OmniFocus to Motion Sync v3 Stable")
+    parser.add_argument("--refresh-mapping", action="store_true", help="Force refresh of Motion data mapping and then sync")
+    parser.add_argument("--sync-only", action="store_true", help="Only run sync, skip mapping creation (uses existing local data)")
+    parser.add_argument("--mapping-only", action="store_true", help="Only create/refresh the local mapping file, skip sync")
+    parser.add_argument("--config", type=str, default="config.json", help="Path to configuration file (default: config.json)")
+
+    args = parser.parse_args()
+    
+    # Load configuration
+    config = Config(args.config)
+    
+    api_key = os.getenv("MOTION_API_KEY")
+    if not api_key:
+        api_key = input("Enter your Motion API key: ").strip()
+        if not api_key:
+            print("❌ No API key provided. Exiting.")
+            return
+    
+    MotionSync.set_api_key(api_key)
+    sync = MotionHybridSync(api_key, config)
+    
+    try:
+        if args.mapping_only:
+            print("📊 Running mapping creation only...")
+            sync.create_comprehensive_mapping()
+        elif args.sync_only:
+            print("🔄 Running sync only...")
+            sync.sync_omnifocus_to_motion()
+        else:
+            sync.run_bidirectional_sync(refresh_mapping=args.refresh_mapping)
+            
+    except KeyboardInterrupt:
+        print("\n⏹️ Process interrupted by user")
+    except Exception as e:
+        print(f"❌ An unexpected error occurred: {e}")
+        traceback.print_exc()
 
 if __name__ == "__main__":
-    print("🚀 Starting OmniFocus -> Motion Sync Script (v1.4 - Delete Motion Task on OF Completion)")
-    if not MOTION_API_KEY: sys.exit("❌ Critical: MOTION_API_KEY missing.")
-    print(f"🔑 Using Motion API key ending: ...{MOTION_API_KEY[-4:]}")
-    try: import requests; from collections import deque; import traceback; import datetime
-    except ImportError as e: sys.exit(f"❌ Critical: Missing import: {e}")
     main()
-

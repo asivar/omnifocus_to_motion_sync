@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# Personal config (use config.example.json as template)
+config.json
+
+# Personal LaunchAgent (use com.yourusername.omnifocus-motion-sync.example.plist as template)
+com.yourusername.omnifocus-motion-sync.plist
+
+# State files
+motion_hierarchical_mapping.json
+
+# OS files
+.DS_Store
