@@ -11,6 +11,18 @@
   ],
   "sync_settings": {
     "api_rate_limit_delay": 0.2,
-    "workspace_processing_delay": 0.5
+    "workspace_processing_delay": 0.5,
+    "default_due_date_offset_days": 14
+  },
+  "paths": {
+    "lock_file": "/tmp/of2motion.lock",
+    "state_file": "motion_hierarchical_mapping.json",
+    "log_directory": "~/Library/Logs/OmniFocusMotionSync"
+  },
+  "sequential_project_handling": {
+    "enabled": true,
+    "add_description_hints": true,
+    "boost_first_task_priority": true,
+    "add_blocked_by_notes": true
   }
 }

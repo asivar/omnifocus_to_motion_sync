@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.yourusername.omnifocus-motion-healthcheck</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/nhayden/Code/motion sync xcode/motion-sync/venv/bin/python3</string>
+        <string>/Users/nhayden/Code/motion sync xcode/motion-sync/health_check.py</string>
+        <string>--config</string>
+        <string>/Users/nhayden/Code/motion sync xcode/motion-sync/config.json</string>
+    </array>
+
+    <!-- Run every 30 minutes -->
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <!-- Run at load -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Standard output log -->
+    <key>StandardOutPath</key>
+    <string>/Users/nhayden/Library/Logs/OmniFocusMotionSync/healthcheck.log</string>
+
+    <!-- Error log -->
+    <key>StandardErrorPath</key>
+    <string>/Users/nhayden/Library/Logs/OmniFocusMotionSync/healthcheck_error.log</string>
+
+    <!-- Working directory -->
+    <key>WorkingDirectory</key>
+    <string>/Users/nhayden/Code/motion sync xcode/motion-sync</string>
+</dict>
+</plist>
