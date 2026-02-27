@@ -907,10 +907,10 @@ class MotionHybridSync:
     def refresh_motion_task_statuses(self, motion_data: Dict):
         """Check mapped tasks for completions in Motion.
 
-        Optimization: Only checks tasks that are NOT already completed in local
-        data AND were NOT found by refresh_motion_tasks_from_api (which fetches
-        active tasks). If a mapped task isn't in any project's active task list,
-        it may have been completed - check it individually.
+        Optimization: Uses the API-sourced active task IDs from
+        refresh_motion_tasks_from_api (which only returns non-completed tasks).
+        If a mapped task is NOT in that set, it may have been completed -
+        check it individually via GET /tasks/{id}.
         """
         if not self.id_mapper:
             return motion_data
@@ -919,23 +919,18 @@ class MotionHybridSync:
         if not mappings:
             return motion_data
 
-        # Build set of all active Motion task IDs currently in local data
-        active_motion_ids = set()
-        for ws_data in motion_data.get('workspaces', {}).values():
-            for proj_data in ws_data.get('projects', {}).values():
-                for task_data in proj_data.get('tasks', {}).values():
-                    status = (task_data.get('status') or {}).get('name', '').lower()
-                    if status != 'completed' and task_data.get('id'):
-                        active_motion_ids.add(task_data['id'])
+        # Use API-sourced active IDs (set by refresh_motion_tasks_from_api)
+        # This is what Motion actually says is active, not stale local data
+        active_motion_ids = getattr(self, '_api_active_motion_ids', set())
 
-        # Only check tasks that are mapped but NOT in the active list
+        # Only check tasks that are mapped but NOT in the API active list
         # (they may have been completed or deleted in Motion)
         tasks_to_check = []
         for mapping in mappings.values():
             motion_id = mapping.get('motion_id')
             if not motion_id:
                 continue
-            # Skip if already known to be active (just refreshed from API)
+            # Skip if the API confirmed this task is still active
             if motion_id in active_motion_ids:
                 continue
             # Skip if already marked completed in local data
@@ -990,13 +985,18 @@ class MotionHybridSync:
         return motion_data
 
     def refresh_motion_tasks_from_api(self, motion_data: Dict) -> Dict:
-        """Fetch current tasks from Motion API and merge new ones into local data.
+        """Fetch current tasks from Motion API and merge into local data.
 
-        This discovers tasks created directly in Motion that aren't in the local
-        JSON file yet. Without this, Motion-only tasks are invisible to reverse sync.
+        This does two things:
+        1. Discovers tasks created directly in Motion (not in local JSON)
+        2. Builds a set of active Motion task IDs for completion detection
+
+        The active IDs set is stored on self so refresh_motion_task_statuses
+        can use it to identify tasks that disappeared (completed/deleted).
         """
-        print("🔄 Refreshing Motion tasks from API to discover new tasks...")
+        print("🔄 Refreshing Motion tasks from API...")
         new_task_count = 0
+        self._api_active_motion_ids = set()  # Track what Motion API says is active
 
         for ws_name, ws_data in motion_data.get('workspaces', {}).items():
             ws_id = ws_data.get('id')
@@ -1011,6 +1011,11 @@ class MotionHybridSync:
                 # Fetch current tasks from Motion API for this project
                 api_tasks = self.get_tasks_for_project(proj_id, proj_name)
                 local_tasks = proj_data.get('tasks', {})
+
+                # Track all active task IDs from the API
+                for task_data in api_tasks.values():
+                    if task_data.get('id'):
+                        self._api_active_motion_ids.add(task_data['id'])
 
                 # Merge any new tasks that aren't in local data
                 for task_name, task_data in api_tasks.items():
