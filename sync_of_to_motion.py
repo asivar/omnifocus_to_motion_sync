@@ -946,10 +946,25 @@ class MotionHybridSync:
 
         logger.info(f"\n🎯 HIERARCHICAL MAPPING COMPLETE! Workspaces: {len(workspaces)}, Projects: {total_projects}, Tasks: {total_tasks}")
         if not self.dry_run:
+            if 'metadata' not in mapping_data:
+                mapping_data['metadata'] = {}
+            mapping_data['metadata']['last_full_refresh_timestamp'] = datetime.now(timezone.utc).isoformat()
             self.save_motion_data_to_file(mapping_data, update_timestamp=False)
         else:
             logger.info("[DRY RUN] Would save mapping data to file")
         return mapping_data
+
+    def _should_refresh_mapping(self, motion_data: Dict, refresh_hours: int = 6) -> bool:
+        """Check if the Motion cache is stale and needs a full refresh."""
+        last_refresh = motion_data.get('metadata', {}).get('last_full_refresh_timestamp')
+        if not last_refresh:
+            return True
+        try:
+            last_refresh_dt = datetime.fromisoformat(last_refresh)
+            elapsed = datetime.now(timezone.utc) - last_refresh_dt
+            return elapsed > timedelta(hours=refresh_hours)
+        except (ValueError, TypeError):
+            return True
 
     def load_motion_data_from_file(self) -> Dict:
         """Loads the entire motion data structure from the local JSON file."""
@@ -1098,6 +1113,9 @@ class MotionHybridSync:
         """Real OmniFocus to Motion synchronization using local JSON data. Returns forward stats."""
         logger.info(" Starting OmniFocus to Motion synchronization...")
         local_data = self.load_motion_data_from_file()
+        if self._should_refresh_mapping(local_data):
+            logger.info("🔄 Motion cache is stale — triggering automatic refresh...")
+            local_data = self.create_comprehensive_mapping()
         # Load OF structure only if not already loaded (standalone mode)
         if not self.of_structure:
             self.of_structure = self.load_omnifocus_structure()
