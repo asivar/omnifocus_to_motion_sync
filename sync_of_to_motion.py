@@ -1115,7 +1115,9 @@ class MotionHybridSync:
         local_data = self.load_motion_data_from_file()
         if self._should_refresh_mapping(local_data):
             logger.info("🔄 Motion cache is stale — triggering automatic refresh...")
-            local_data = self.create_comprehensive_mapping()
+            refreshed = self.create_comprehensive_mapping()
+            if refreshed:
+                local_data = refreshed
         # Load OF structure only if not already loaded (standalone mode)
         if not self.of_structure:
             self.of_structure = self.load_omnifocus_structure()
