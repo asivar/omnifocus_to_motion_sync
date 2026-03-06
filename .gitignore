@@ -2,6 +2,10 @@
 __pycache__/
 *.pyc
 venv/
+.mypy_cache/
+
+# Secrets
+.env
 
 # Personal config (use config.example.json as template)
 config.json
@@ -18,6 +22,9 @@ sync_history.jsonl
 
 # Xcode project
 motion-sync.xcodeproj/
+
+# Runtime logs
+sync_output.log
 
 # OS files
 .DS_Store
