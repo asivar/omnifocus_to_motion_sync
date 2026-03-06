@@ -1073,9 +1073,9 @@ class MotionHybridSync:
         })();
         """
         try:
-            result = subprocess.run(["osascript", "-l", "JavaScript", "-e", jxa_script], text=True, capture_output=True, check=True, encoding='utf-8')
+            result = subprocess.run(["osascript", "-l", "JavaScript", "-e", jxa_script], text=True, capture_output=True, check=True, encoding='utf-8', timeout=60)
             raw_data = json.loads(result.stdout)
-            
+
             # ✅ FIXED: Check for error response from OmniFocus
             if isinstance(raw_data, dict) and 'error' in raw_data:
                 logger.error(f"❌ OmniFocus error: {raw_data['error']}")
@@ -1105,7 +1105,10 @@ class MotionHybridSync:
             
             logger.info(f"📱 Found {len(of_structure)} OF folders, {sum(len(f.projects) for f in of_structure)} projects, {sum(len(p.tasks) for f in of_structure for p in f.projects)} tasks.")
             return of_structure
-        except Exception as e: 
+        except subprocess.TimeoutExpired:
+            logger.error("🚨 OmniFocus JXA script timed out after 60 seconds")
+            return []
+        except Exception as e:
             logger.error(f"🚨 Unexpected OF error: {e}")
             return []
 
