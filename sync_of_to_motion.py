@@ -2270,15 +2270,22 @@ class MotionHybridSync:
 
         self.log_workspace_schedule_info()
 
+        # Phase 1 runs FIRST: detect Motion completions/new tasks before
+        # Phase 2 creates new Motion tasks (avoids overwriting mappings
+        # for tasks completed in Motion between cycles)
         logger.info("\n" + "=" * 50)
-        logger.info("Phase 1: OmniFocus → Motion")
-        logger.info("=" * 50)
-        forward_stats = self.sync_omnifocus_to_motion()
-
-        logger.info("\n" + "=" * 50)
-        logger.info("Phase 2: Motion → OmniFocus")
+        logger.info("Phase 1: Motion → OmniFocus")
         logger.info("=" * 50)
         reverse_stats = self.sync_motion_to_omnifocus()
+
+        # Reload OF structure to pick up changes from Phase 1 (e.g., completed
+        # repeating tasks that regenerated as new instances)
+        self.of_structure = self.load_omnifocus_structure()
+
+        logger.info("\n" + "=" * 50)
+        logger.info("Phase 2: OmniFocus → Motion")
+        logger.info("=" * 50)
+        forward_stats = self.sync_omnifocus_to_motion()
 
         # Prune stale mappings (after both sync directions have run)
         # Load state data directly to avoid load_motion_data_from_file() which
