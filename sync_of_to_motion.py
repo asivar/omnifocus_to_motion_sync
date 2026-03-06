@@ -979,14 +979,16 @@ class MotionHybridSync:
     def load_omnifocus_structure(self):
         """Load OmniFocus data structure using JXA script."""
         logger.info("📱 Loading OmniFocus structure...")
-        jxa_script = r"""
-        (() => {
-            const of = Application('OmniFocus');
-            if (!of.running()) { return JSON.stringify({error: "OmniFocus is not running."}); }
+        ignored_json = json.dumps(getattr(self, 'ignored_folders', []))
+        jxa_script = "\n        (() => {\n" + \
+            "            const of = Application('OmniFocus');\n" + \
+            "            const ignoredFolders = " + ignored_json + ";\n" + \
+            r"""            if (!of.running()) { return JSON.stringify({error: "OmniFocus is not running."}); }
             const formatDate = (date) => {
                 if (!date || !(date instanceof Date) || isNaN(date.getTime())) return null;
                 return `${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, '0')}-${date.getDate().toString().padStart(2, '0')}`;
             };
+            let totalTaskCount = 0;
             const processProject = (p) => {
                 if (!p || !p.id || typeof p.id !== 'function' || !p.name || typeof p.name !== 'function') return null;
                 let projectStatus = ''; try { projectStatus = p.status(); } catch(e) {}
@@ -994,69 +996,88 @@ class MotionHybridSync:
                 if (isDropped || projectStatus === 'on hold') return null;
                 let sequential = false;
                 try { sequential = p.sequential(); } catch(e) {}
+                const pName = p.name();
                 const projectData = {
-                    id: p.id(), name: p.name(), url: 'omnifocus:///project/' + p.id(),
+                    id: p.id(), name: pName, url: 'omnifocus:///project/' + p.id(),
                     modificationDate: p.modificationDate() ? p.modificationDate().toISOString() : null,
                     completed: p.completed(), sequential: sequential, tasks: []
                 };
                 try {
-                    p.flattenedTasks().forEach(t => {
-                        if (!t || !t.id || typeof t.id !== 'function' || !t.name || typeof t.name !== 'function') return;
-                        const taskName = t.name();
-                        if (!taskName || taskName === '-----------') return;
-                        
-                        let isDropped = false; try { isDropped = t.dropped(); } catch(e) {}
-                        if (isDropped) return;
+                    // BATCH property access: 1 Apple Event per property instead of N
+                    const taskSpec = p.flattenedTasks;
+                    const ids = taskSpec.id();
+                    if (!ids || ids.length === 0) return projectData;
+                    const count = ids.length;
+                    const names = taskSpec.name();
+                    const notes = taskSpec.note();
+                    const completeds = taskSpec.completed();
+                    const dueDates = taskSpec.dueDate();
+                    const deferDates = taskSpec.deferDate();
+                    const estMins = taskSpec.estimatedMinutes();
+                    const flaggeds = taskSpec.flagged();
+                    const modDates = taskSpec.modificationDate();
+                    const droppeds = taskSpec.dropped();
 
-                        let estimatedMins = null;
-                        try { const mr = t.estimatedMinutes(); if (typeof mr === 'number' && mr > 0) estimatedMins = mr; } catch (e) {}
-                        
-                        // ✅ NEW: Capture defer date (start date)
-                        let deferDate = null;
-                        try { deferDate = formatDate(t.deferDate()); } catch (e) {}
-                        
-                        // ✅ NEW: Capture contexts/tags
+                    // Batch tag names: returns array of arrays [["tag1","tag2"], ["tag3"], ...]
+                    let allTagNames;
+                    try { allTagNames = taskSpec.tags.name(); }
+                    catch (e) { allTagNames = ids.map(() => []); }
+
+                    // Batch repetition rules
+                    let allRepeatRules;
+                    try { allRepeatRules = taskSpec.repetitionRule(); }
+                    catch (e) { allRepeatRules = ids.map(() => null); }
+
+                    for (let i = 0; i < count; i++) {
+                        const taskName = names[i];
+                        if (!taskName || taskName === '-----------') continue;
+                        if (droppeds[i]) continue;
+
+                        totalTaskCount++;
+
+                        const em = estMins[i];
+                        const estimatedMin = (typeof em === 'number' && em > 0) ? em : null;
+
                         let contexts = [];
-                        let ofPriority = null;  // Track OF priority separately
-                        try { 
-                            const taskTags = t.tags();
-                            taskTags.forEach(tag => {
-                                const tagName = tag.name();
+                        let ofPriority = null;
+                        const tagNames = allTagNames[i] || [];
+                        if (Array.isArray(tagNames)) {
+                            tagNames.forEach(tagName => {
+                                if (!tagName) return;
                                 contexts.push(tagName);
-                                
-                                        // Detect priority tags (strip emojis/symbols, trim whitespace)
                                 const tagClean = tagName.replace(/[^\p{L}\p{N}\s]/gu, '').trim().toLowerCase();
                                 if (tagClean === 'high' || tagClean === 'high priority') ofPriority = 'high';
                                 else if (tagClean === 'medium' || tagClean === 'medium priority') ofPriority = 'medium';
                                 else if (tagClean === 'low' || tagClean === 'low priority') ofPriority = 'low';
                             });
-                        } catch (e) {}
-                        
-                        // ✅ NEW: Capture repeat rule
+                        }
+
                         let repeatRule = null;
                         try {
-                            const rule = t.repetitionRule();
-                            if (rule) repeatRule = rule.ruleString();
+                            const rule = allRepeatRules[i];
+                            if (rule && rule.ruleString) repeatRule = rule.ruleString();
                         } catch (e) {}
-                        
+
                         projectData.tasks.push({
-                            id: t.id(), name: taskName, note: t.note() || null, completed: t.completed(),
-                            url: 'omnifocus:///task/' + t.id(), dueDate: formatDate(t.dueDate()),
-                            deferDate: deferDate,  // ✅ NEW
-                            durationMinutes: estimatedMins, flagged: t.flagged(),
-                            contexts: contexts,  // ✅ NEW
-                            ofPriority: ofPriority,  // ✅ NEW: Explicit priority
-                            repeatRule: repeatRule,  // ✅ NEW
-                            modificationDate: t.modificationDate() ? t.modificationDate().toISOString() : null
+                            id: ids[i], name: taskName, note: notes[i] || null, completed: completeds[i],
+                            url: 'omnifocus:///task/' + ids[i], dueDate: formatDate(dueDates[i]),
+                            deferDate: formatDate(deferDates[i]),
+                            durationMinutes: estimatedMin, flagged: flaggeds[i],
+                            contexts: contexts,
+                            ofPriority: ofPriority,
+                            repeatRule: repeatRule,
+                            modificationDate: modDates[i] ? modDates[i].toISOString() : null
                         });
-                    });
+                    }
                 } catch (e) {}
                 return projectData;
             };
             const structure = [];
             of.defaultDocument.folders().forEach(f => {
                 if (!f || !f.name || typeof f.name !== 'function') return;
-                const folderData = { id: f.id(), name: f.name(), projects: [] };
+                const fName = f.name();
+                if (ignoredFolders.indexOf(fName) !== -1) return;
+                const folderData = { id: f.id(), name: fName, projects: [] };
                 f.flattenedProjects().forEach(p => {
                     const projectData = processProject(p);
                     if (projectData) folderData.projects.push(projectData);
@@ -1073,7 +1094,10 @@ class MotionHybridSync:
         })();
         """
         try:
-            result = subprocess.run(["osascript", "-l", "JavaScript", "-e", jxa_script], text=True, capture_output=True, check=True, encoding='utf-8', timeout=180)
+            result = subprocess.run(["osascript", "-l", "JavaScript", "-e", jxa_script], text=True, capture_output=True, check=True, encoding='utf-8', timeout=300)
+            if result.stderr:
+                for line in result.stderr.strip().splitlines():
+                    logger.debug(f"JXA: {line}")
             raw_data = json.loads(result.stdout)
 
             # ✅ FIXED: Check for error response from OmniFocus
@@ -1105,8 +1129,12 @@ class MotionHybridSync:
             
             logger.info(f"📱 Found {len(of_structure)} OF folders, {sum(len(f.projects) for f in of_structure)} projects, {sum(len(p.tasks) for f in of_structure for p in f.projects)} tasks.")
             return of_structure
-        except subprocess.TimeoutExpired:
-            logger.error("🚨 OmniFocus JXA script timed out after 180 seconds")
+        except subprocess.TimeoutExpired as e:
+            logger.error("🚨 OmniFocus JXA script timed out after 300 seconds")
+            if e.stderr:
+                logger.error("JXA debug output before timeout:")
+                for line in e.stderr.strip().splitlines():
+                    logger.error(f"  {line}")
             return []
         except Exception as e:
             logger.error(f"🚨 Unexpected OF error: {e}")
