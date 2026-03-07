@@ -504,22 +504,49 @@ class OmniFocusManager:
             return False
     
     @staticmethod
+    def _applescript_date_lines(date_str: str, var_name: str) -> List[str]:
+        """Generate AppleScript lines to create a date variable from YYYY-MM-DD.
+        Sets day to 1 before month to avoid overflow (e.g. Jan 31 → set month to Feb)."""
+        parts = date_str.split('-')
+        year, month, day = parts[0], int(parts[1]), int(parts[2])
+        return [
+            f'set {var_name} to current date',
+            f'set day of {var_name} to 1',
+            f'set year of {var_name} to {year}',
+            f'set month of {var_name} to {month}',
+            f'set day of {var_name} to {day}',
+            f'set time of {var_name} to 0',
+        ]
+
+    @staticmethod
     def update_task(task_id: str, updates: Dict[str, Any]) -> bool:
         """Update OmniFocus task fields using AppleScript."""
+        preamble_lines = []  # Date setup — must be outside tell block
         update_lines = []
 
         if 'flagged' in updates:
             val = "true" if updates['flagged'] else "false"
             update_lines.append(f'set flagged of theTask to {val}')
 
-        if 'due_date' in updates and updates['due_date']:
-            update_lines.append(f'set due date of theTask to date "{updates["due_date"]}"')
+        if 'due_date' in updates:
+            if updates['due_date']:
+                preamble_lines.extend(OmniFocusManager._applescript_date_lines(updates['due_date'], 'dueD'))
+                update_lines.append('set due date of theTask to dueD')
+            else:
+                update_lines.append('set due date of theTask to missing value')
 
-        if 'defer_date' in updates and updates['defer_date']:
-            update_lines.append(f'set defer date of theTask to date "{updates["defer_date"]}"')
+        if 'defer_date' in updates:
+            if updates['defer_date']:
+                preamble_lines.extend(OmniFocusManager._applescript_date_lines(updates['defer_date'], 'deferD'))
+                update_lines.append('set defer date of theTask to deferD')
+            else:
+                update_lines.append('set defer date of theTask to missing value')
 
-        if 'duration_minutes' in updates and updates['duration_minutes']:
-            update_lines.append(f'set estimated minutes of theTask to {updates["duration_minutes"]}')
+        if 'duration_minutes' in updates:
+            if updates['duration_minutes']:
+                update_lines.append(f'set estimated minutes of theTask to {updates["duration_minutes"]}')
+            else:
+                update_lines.append('set estimated minutes of theTask to missing value')
 
         if 'note' in updates and updates['note'] is not None:
             escaped_note = updates['note'].replace('\\', '\\\\').replace('"', '\\"')
@@ -528,9 +555,11 @@ class OmniFocusManager:
         if not update_lines:
             return True  # Nothing to update
 
+        preamble_block = "\n            ".join(preamble_lines)
         update_block = "\n                    ".join(update_lines)
 
         applescript = f'''
+            {preamble_block}
             tell application "OmniFocus"
                 if not running then return "omnifocus_not_running"
                 tell default document
@@ -582,14 +611,18 @@ class OmniFocusManager:
 
         props_str = ", ".join(props)
 
-        # Due date needs to be set separately since AppleScript date parsing is tricky
+        # Due date: build date variable outside tell block, reference inside
+        date_preamble = ""
         due_date_line = ""
         if due_date:
             # due_date expected as "YYYY-MM-DD"
-            due_date_line = f'''
-                    set due date of newTask to date "{due_date}"'''
+            preamble_lines = OmniFocusManager._applescript_date_lines(due_date, 'dueD')
+            date_preamble = "\n            ".join(preamble_lines)
+            due_date_line = '''
+                    set due date of newTask to dueD'''
 
         applescript = f'''
+            {date_preamble}
             tell application "OmniFocus"
                 if not running then return "omnifocus_not_running"
                 tell default document
@@ -1069,7 +1102,7 @@ class MotionHybridSync:
                             modificationDate: modDates[i] ? modDates[i].toISOString() : null
                         });
                     }
-                } catch (e) {}
+                } catch (e) { console.log('[DEBUG]   ERROR in project ' + pName + ': ' + e); }
                 return projectData;
             };
             const structure = [];
@@ -1289,11 +1322,18 @@ class MotionHybridSync:
                     if task_data.get('id'):
                         self._api_active_motion_ids.add(task_data['id'])
 
-                # Merge any new tasks that aren't in local data
+                # Merge new tasks and update existing tasks from API
                 for task_name, task_data in api_tasks.items():
                     if task_name not in local_tasks:
                         local_tasks[task_name] = task_data
                         new_task_count += 1
+                    else:
+                        # Update fields that may have changed in Motion
+                        existing = local_tasks[task_name]
+                        for field in ('dueDate', 'startOn', 'duration', 'priority',
+                                      'status', 'updatedTime', 'description'):
+                            if field in task_data:
+                                existing[field] = task_data[field]
 
                 proj_data['tasks'] = local_tasks
                 time.sleep(self.config.api_rate_limit_delay)
@@ -1321,7 +1361,7 @@ class MotionHybridSync:
             self.of_structure = self.load_omnifocus_structure()
         if not self.of_structure:
             logger.error("❌ Failed to load OmniFocus structure. Cannot proceed with reverse sync.")
-            return {'tasks_completed': 0, 'tasks_created': 0, 'failed': 0}
+            return {'tasks_completed': 0, 'tasks_updated': 0, 'tasks_created': 0, 'failed': 0}
 
         # Create reverse sync plan (may add auto-mappings to id_mapper)
         reverse_sync_plan = self.create_reverse_sync_plan(motion_data, self.of_structure)
@@ -1403,6 +1443,12 @@ class MotionHybridSync:
                             # Truly new Motion-only task → create in OmniFocus
                             of_folder = reverse_ws_mapping.get(ws_name, ws_name)
                             if proj_name in of_projects_by_folder.get(of_folder, set()):
+                                # Normalize duration (can be int, "NONE", "REMINDER")
+                                raw_dur = motion_task.get('duration')
+                                try:
+                                    norm_dur = int(raw_dur) if raw_dur and raw_dur not in ('NONE', 'REMINDER') else None
+                                except (ValueError, TypeError):
+                                    norm_dur = None
                                 reverse_sync_plan['of_tasks_to_create'].append({
                                     'motion_id': motion_id,
                                     'task_name': task_name,
@@ -1411,7 +1457,7 @@ class MotionHybridSync:
                                     'description': motion_task.get('description', ''),
                                     'due_date': motion_task.get('dueDate'),
                                     'priority': motion_task.get('priority', 'MEDIUM'),
-                                    'duration': motion_task.get('duration'),
+                                    'duration': norm_dur,
                                 })
                         continue
 
@@ -1432,7 +1478,73 @@ class MotionHybridSync:
                             'project': proj_name
                         })
 
+                    # Check if Motion fields changed more recently than OF
+                    elif not of_task.completed and not motion_completed:
+                        motion_updated = motion_task.get('updatedTime')
+                        of_updated = of_task.of_modification_date
+                        if motion_updated and of_updated:
+                            try:
+                                motion_ts = datetime.fromisoformat(motion_updated.replace('Z', '+00:00'))
+                                of_ts = datetime.fromisoformat(of_updated.replace('Z', '+00:00'))
+                            except (ValueError, AttributeError):
+                                motion_ts = of_ts = None
+
+                            if motion_ts and of_ts and motion_ts > of_ts:
+                                updates, field_changes = {}, []
+
+                                # Due date: normalize both to YYYY-MM-DD
+                                motion_due = (motion_task.get('dueDate') or '')[:10]
+                                if motion_due and motion_due < '2001-01-01':
+                                    motion_due = ''  # Filter sentinel placeholder
+                                of_due = of_task.due_date or ''
+                                if motion_due != of_due:
+                                    updates['due_date'] = motion_due if motion_due else None
+                                    field_changes.append('due date')
+
+                                # Defer/start date: Motion startOn vs OF defer_date
+                                # Filter sentinel values (Motion uses 2000-12-30 as placeholder)
+                                motion_start = (motion_task.get('startOn') or '')[:10]
+                                if motion_start and motion_start < '2001-01-01':
+                                    motion_start = ''
+                                of_defer = of_task.defer_date or ''
+                                if motion_start != of_defer:
+                                    updates['defer_date'] = motion_start if motion_start else None
+                                    field_changes.append('start date')
+
+                                # Duration: normalize NONE/null
+                                motion_dur = motion_task.get('duration')
+                                motion_dur_norm = motion_dur if motion_dur and motion_dur != 'NONE' else None
+                                try:
+                                    motion_dur_norm = int(motion_dur_norm) if motion_dur_norm else None
+                                except (ValueError, TypeError):
+                                    motion_dur_norm = None
+                                of_dur = of_task.duration_minutes
+                                of_dur_norm = int(of_dur) if of_dur and of_dur != 'NONE' else None
+                                if motion_dur_norm != of_dur_norm:
+                                    updates['duration_minutes'] = motion_dur_norm
+                                    field_changes.append('duration')
+
+                                # Priority ASAP → flagged
+                                motion_flagged = (motion_task.get('priority') or '').upper() == 'ASAP'
+                                of_flagged = of_task.flagged or False
+                                if motion_flagged != of_flagged:
+                                    updates['flagged'] = motion_flagged
+                                    field_changes.append('flagged')
+
+                                if updates:
+                                    logger.info(f"   ↪️  Planning OF update for '{task_name}' ({', '.join(field_changes)})")
+                                    reverse_sync_plan['of_tasks_to_update'].append({
+                                        'of_id': of_id,
+                                        'motion_id': motion_id,
+                                        'task_name': task_name,
+                                        'workspace': ws_name,
+                                        'project': proj_name,
+                                        'updates': updates,
+                                        'field_changes': field_changes
+                                    })
+
         logger.info(f"   📊 Tasks to complete in OmniFocus: {len(reverse_sync_plan['of_tasks_to_complete'])}")
+        logger.info(f"   📊 Tasks to update in OmniFocus: {len(reverse_sync_plan['of_tasks_to_update'])}")
         logger.info(f"   📊 Tasks to create in OmniFocus: {len(reverse_sync_plan['of_tasks_to_create'])}")
         return reverse_sync_plan
     
@@ -1445,6 +1557,7 @@ class MotionHybridSync:
             logger.info("⚡ Executing reverse sync plan...")
 
         completed_count = 0
+        updated_count = 0
         created_count = 0
         failed_count = 0
 
@@ -1466,6 +1579,25 @@ class MotionHybridSync:
                 if success:
                     completed_count += 1
                     logger.info(f"      ✅ Completed in OmniFocus")
+                else:
+                    failed_count += 1
+
+        # Update tasks in OmniFocus
+        for task_data in reverse_sync_plan['of_tasks_to_update']:
+            task_name = task_data['task_name']
+            of_id = task_data['of_id']
+            updates = task_data['updates']
+            changes = task_data.get('field_changes', [])
+
+            if dry:
+                updated_count += 1
+                logger.info(f"   [DRY RUN] Would update OF task: '{task_name}' ({', '.join(changes)})")
+            else:
+                logger.info(f"   🔄 Updating OF task: '{task_name}' ({', '.join(changes)})...")
+                success = OmniFocusManager.update_task(of_id, updates)
+                if success:
+                    updated_count += 1
+                    logger.info(f"      ✅ Updated in OmniFocus")
                 else:
                     failed_count += 1
 
@@ -1493,6 +1625,8 @@ class MotionHybridSync:
                 flagged = task_data.get('priority') == 'ASAP'
                 raw_due = task_data.get('due_date') or ''
                 of_due_date = raw_due[:10] if raw_due else None
+                if of_due_date and of_due_date < '2001-01-01':
+                    of_due_date = None  # Filter sentinel placeholder
 
                 new_of_id = OmniFocusManager.create_task(
                     project_name=proj_name,
@@ -1530,16 +1664,17 @@ class MotionHybridSync:
 
         if not dry:
             # Always save - auto-mappings from create_reverse_sync_plan need persisting
-            has_changes = created_count > 0 or completed_count > 0
+            has_changes = created_count > 0 or completed_count > 0 or updated_count > 0
             self.save_motion_data_to_file(motion_data, update_timestamp=has_changes)
 
         logger.info(f"\n📊 Reverse Sync Results:")
         logger.info(f"   ✅ Completed: {completed_count}")
+        logger.info(f"   🔄 Updated: {updated_count}")
         logger.info(f"   ➕ Created: {created_count}")
         if failed_count > 0:
             logger.error(f"   ❌ Failed: {failed_count}")
 
-        return {'tasks_completed': completed_count, 'tasks_created': created_count, 'failed': failed_count}
+        return {'tasks_completed': completed_count, 'tasks_updated': updated_count, 'tasks_created': created_count, 'failed': failed_count}
 
     def perform_sync_comparison_from_structure(self, motion_data: Dict) -> Dict:
         """Perform sync comparison using the loaded OmniFocus structure. Returns forward stats."""
@@ -1619,7 +1754,13 @@ class MotionHybridSync:
                         
                         elif not task.completed:
                             of_mod_time = task.of_modification_date
-                            modified_since_sync = (not self.last_sync_timestamp) or (of_mod_time and of_mod_time > self.last_sync_timestamp)
+                            try:
+                                modified_since_sync = (not self.last_sync_timestamp) or (
+                                    of_mod_time and datetime.fromisoformat(of_mod_time.replace('Z', '+00:00'))
+                                    > datetime.fromisoformat(self.last_sync_timestamp.replace('Z', '+00:00'))
+                                )
+                            except (ValueError, AttributeError):
+                                modified_since_sync = True  # Default to full check on parse failure
 
                             # Always check priority (cheap comparison, catches stale mismatches)
                             # Only do full field comparison if OF task was modified after last sync
@@ -1826,23 +1967,33 @@ class MotionHybridSync:
             # Due date: normalize both to YYYY-MM-DD
             of_due_date = getattr(of_task, 'due_date', None) or ""
             motion_due = (motion_task.get('dueDate') or "")[:10]
+            if motion_due and motion_due < '2001-01-01':
+                motion_due = ""  # Filter sentinel placeholder
             if of_due_date != motion_due:
                 updates_needed['dueDate'] = of_due_date or None
                 field_changes.append("due date")
 
-            # Duration: normalize None/0/"NONE" to comparable values
+            # Duration: normalize None/0/"NONE" to int for consistent comparison
             of_duration = getattr(of_task, 'duration_minutes', None)
             motion_duration = motion_task.get('duration')
-            of_dur_normalized = of_duration if of_duration and of_duration != "NONE" else None
-            motion_dur_normalized = motion_duration if motion_duration and motion_duration != "NONE" else None
+            try:
+                of_dur_normalized = int(of_duration) if of_duration and of_duration != "NONE" else None
+            except (ValueError, TypeError):
+                of_dur_normalized = None
+            try:
+                motion_dur_normalized = int(motion_duration) if motion_duration and motion_duration != "NONE" else None
+            except (ValueError, TypeError):
+                motion_dur_normalized = None
             if of_dur_normalized != motion_dur_normalized:
                 updates_needed['duration'] = of_dur_normalized
                 field_changes.append("duration")
 
             # Description: compare body only (strip metadata from both sides)
             # Motion returns HTML in descriptions — strip before comparing
+            # Also strip "Start date: ..." lines (defer dates stored in description, not a body change)
             of_note_body = extract_body(getattr(of_task, 'note', None) or '')
-            motion_desc_body = extract_body(strip_html(motion_task.get('description', '') or ''))
+            motion_desc_raw = extract_body(strip_html(motion_task.get('description', '') or ''))
+            motion_desc_body = re.sub(r'^Start date:\s*\S*\s*', '', motion_desc_raw).strip()
             if of_note_body != motion_desc_body:
                 of_tags = getattr(of_task, 'contexts', []) or []
                 of_url = getattr(of_task, 'url', None)
@@ -2304,6 +2455,7 @@ class MotionHybridSync:
                      f"{forward_stats.get('tasks_completed', 0)} completed, "
                      f"{forward_stats.get('failed', 0)} failed")
         logger.info(f"  Motion → OF:  {reverse_stats.get('tasks_created', 0)} created, "
+                     f"{reverse_stats.get('tasks_updated', 0)} updated, "
                      f"{reverse_stats.get('tasks_completed', 0)} completed, "
                      f"{reverse_stats.get('failed', 0)} failed")
         logger.info(f"  Duration:     {duration:.1f}s")
