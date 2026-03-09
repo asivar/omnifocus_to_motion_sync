@@ -112,6 +112,47 @@ SQLite was evaluated for state management but dropped. This is a single-user per
 
 ---
 
+## Phase 6: Next-Action-Only Sync for Sequential Projects
+
+**Goal:** Reduce Motion noise and eliminate manual dependency management by only syncing the *next available action* from sequential projects — not all tasks.
+
+**Context:** Motion's API has no native dependency support. The current approach syncs all tasks from sequential projects with text-based "Blocked by" hints in descriptions. This forces a manual weekly review of dependency chains (~30-45 min) and causes daily rescheduling friction when Motion schedules blocked tasks the user can't act on.
+
+### 6.1 Config: Feature Flag
+- [ ] Add `sequential_project_handling.next_action_only` boolean to `config.json` (default: `false` — opt-in)
+- [ ] When `true`, only the first incomplete task in a sequential project is synced to Motion
+- [ ] When `false`, current behavior preserved (all tasks synced with sequence metadata)
+- [ ] Validate in `Config` class with clear log message on mode
+
+### 6.2 Forward Sync: Filter Sequential Tasks
+- [ ] In `create_sync_plan_from_structure()`, when `next_action_only` is enabled:
+  - For sequential projects, identify the first incomplete task
+  - Only add that task to `tasks_to_create` (skip all subsequent tasks)
+  - Skip subsequent tasks from `tasks_to_update` as well
+- [ ] When a previously-synced blocked task is no longer in the sync plan, decide handling:
+  - Option A: Leave orphaned tasks in Motion (simplest)
+  - Option B: Complete/remove them from Motion (cleaner but riskier)
+  - **Decision needed from user**
+
+### 6.3 Completion Cascade
+- [ ] When the current next action is completed in Motion → bidirectional sync completes it in OF → next sync cycle detects the new first incomplete task → pushes it to Motion
+- [ ] Verify this works with existing `run_bidirectional_sync()` flow (should work naturally)
+- [ ] Add logging: "Sequential project '{name}': pushing next action '{task}' (was blocked by '{prev}')"
+
+### 6.4 Cleanup of Previously-Synced Blocked Tasks
+- [ ] When switching from all-tasks mode to next-action-only mode:
+  - Identify tasks in Motion that are no longer the next action
+  - Either complete them or leave them (based on 6.2 decision)
+- [ ] Handle edge case: user manually completes a non-first task in OmniFocus (reorder)
+
+### 6.5 Due Date Handling (Related)
+- [ ] Evaluate removing `default_due_date_offset_days: 14` for next-action-only tasks
+  - These tasks are genuinely actionable — a synthetic due date may still be useful for Motion scheduling
+  - But the 14-day window creates false "overdue" states
+  - **Decision needed: increase offset, remove default, or keep as-is?**
+
+---
+
 ## Sprint History
 
 | Sprint | Focus | Status |
