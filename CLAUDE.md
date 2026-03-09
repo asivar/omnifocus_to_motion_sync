@@ -129,21 +129,24 @@ SQLite was evaluated for state management but dropped. This is a single-user per
   - For sequential projects, identify the first incomplete task
   - Only add that task to `tasks_to_create` (skip all subsequent tasks)
   - Skip subsequent tasks from `tasks_to_update` as well
-- [ ] When a previously-synced blocked task is no longer in the sync plan, decide handling:
-  - Option A: Leave orphaned tasks in Motion (simplest)
-  - Option B: Complete/remove them from Motion (cleaner but riskier)
-  - **Decision needed from user — TBD**
+- **Decision: One-time cleanup script, not ongoing logic.**
+  - [ ] Create `cleanup_blocked_tasks.py` — one-time script that removes non-next-action tasks from Motion for sequential projects
+  - [ ] Run cleanup once before enabling `next_action_only` mode
+  - [ ] Main sync script does NOT handle orphan removal — it simply stops syncing blocked tasks going forward
+  - [ ] Safety net: disabling `next_action_only` re-syncs all tasks back from OF (source of truth)
 
 ### 6.3 Completion Cascade
 - [ ] When the current next action is completed in Motion → bidirectional sync completes it in OF → next sync cycle detects the new first incomplete task → pushes it to Motion
 - [ ] Verify this works with existing `run_bidirectional_sync()` flow (should work naturally)
 - [ ] Add logging: "Sequential project '{name}': pushing next action '{task}' (was blocked by '{prev}')"
 
-### 6.4 Cleanup of Previously-Synced Blocked Tasks
-- [ ] When switching from all-tasks mode to next-action-only mode:
-  - Identify tasks in Motion that are no longer the next action
-  - Either complete them or leave them (based on 6.2 decision)
-- [ ] Handle edge case: user manually completes a non-first task in OmniFocus (reorder)
+### 6.4 One-Time Migration: `cleanup_blocked_tasks.py`
+- [ ] Read state file to find all tasks mapped to sequential projects
+- [ ] For each sequential project, identify which task is the current next action in OF
+- [ ] Delete all other tasks for that project from Motion via API
+- [ ] Update state file to remove deleted task mappings
+- [ ] Add `--dry-run` support (list what would be deleted without deleting)
+- [ ] Handle edge case: user manually completes a non-first task in OmniFocus (reorder detection in main sync)
 
 ### 6.5 Due Date Handling
 **Decision: Change `default_due_date_offset_days` from 14 → 120 (global, all tasks without OF due dates).**
