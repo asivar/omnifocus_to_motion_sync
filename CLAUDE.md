@@ -132,7 +132,7 @@ SQLite was evaluated for state management but dropped. This is a single-user per
 - [ ] When a previously-synced blocked task is no longer in the sync plan, decide handling:
   - Option A: Leave orphaned tasks in Motion (simplest)
   - Option B: Complete/remove them from Motion (cleaner but riskier)
-  - **Decision needed from user**
+  - **Decision needed from user — TBD**
 
 ### 6.3 Completion Cascade
 - [ ] When the current next action is completed in Motion → bidirectional sync completes it in OF → next sync cycle detects the new first incomplete task → pushes it to Motion
@@ -145,11 +145,14 @@ SQLite was evaluated for state management but dropped. This is a single-user per
   - Either complete them or leave them (based on 6.2 decision)
 - [ ] Handle edge case: user manually completes a non-first task in OmniFocus (reorder)
 
-### 6.5 Due Date Handling (Related)
-- [ ] Evaluate removing `default_due_date_offset_days: 14` for next-action-only tasks
-  - These tasks are genuinely actionable — a synthetic due date may still be useful for Motion scheduling
-  - But the 14-day window creates false "overdue" states
-  - **Decision needed: increase offset, remove default, or keep as-is?**
+### 6.5 Due Date Handling
+**Decision: Change `default_due_date_offset_days` from 14 → 120 (global, all tasks without OF due dates).**
+
+Rationale: If a task has no due date in OF, it's not urgent. 120 days prevents Motion from aggressively scheduling it while still keeping it visible. When a real due date is added in OF, the next sync cycle overwrites the placeholder — existing `_check_task_for_updates()` already handles this (line ~1968).
+
+- [ ] Update `config.example.json`: `default_due_date_offset_days: 120`
+- [ ] Update user's `config.json`: `default_due_date_offset_days: 120`
+- [ ] Verify `_check_task_for_updates` correctly overwrites the 120-day placeholder when a real due date is added in OF (should already work — confirm with `--dry-run`)
 
 ---
 
