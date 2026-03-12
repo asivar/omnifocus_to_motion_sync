@@ -1,33 +1,14 @@
-# Python
-__pycache__/
-*.pyc
-venv/
-.mypy_cache/
-
-# Secrets
 .env
-
-# Personal config (use config.example.json as template)
 config.json
-
-# Personal LaunchAgents (use .example.plist files as templates)
-com.yourusername.omnifocus-motion-sync.plist
-com.yourusername.omnifocus-motion-healthcheck.plist
-
-# State files
+sync_output.log
+sync_output.log.*.bz2
+sync_history.jsonl
 motion_hierarchical_mapping.json
 motion_hierarchical_mapping.json.backup
 motion_hierarchical_mapping.json.sha256
-sync_history.jsonl
-
-# Xcode project
-motion-sync.xcodeproj/
-
-# Runtime logs
-sync_output.log
-
-# OS files
+*.bak
+__pycache__/
+.pytest_cache/
+.mypy_cache/
 .DS_Store
-
-# Lock file
-/tmp/of2motion.lock
+venv/

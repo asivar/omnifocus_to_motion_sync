@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 1. Set the working directory to where your script and JSON mapping live
-cd "$(dirname "$0")" || exit 1
+cd "/Users/valhalla-farms/scripts" || exit 1
 
 # 2. Load API key from .env file
 if [ -f .env ]; then
@@ -12,4 +12,4 @@ else
 fi
 
 # 3. Run the sync script using the venv python
-./venv/bin/python sync_of_to_motion.py >> sync_output.log 2>&1
+/Users/valhalla-farms/scripts/venv/bin/python sync_of_to_motion.py >> sync_output.log 2>&1
