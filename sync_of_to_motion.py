@@ -1088,7 +1088,13 @@ class MotionHybridSync:
                         let repeatRule = null;
                         try {
                             const rule = allRepeatRules[i];
-                            if (rule && rule.ruleString) repeatRule = rule.ruleString();
+                            if (rule) {
+                                // OmniFocus 4 returns an object with .recurrence (RRULE string)
+                                // and .repetitionMethod ("fixed repetition" / "start after completion")
+                                if (rule.recurrence) repeatRule = rule.recurrence;
+                                else if (typeof rule.ruleString === 'function') repeatRule = rule.ruleString();
+                                else if (rule.ruleString) repeatRule = rule.ruleString;
+                            }
                         } catch (e) {}
 
                         projectData.tasks.push({
@@ -1431,14 +1437,19 @@ class MotionHybridSync:
                                 logger.info(f"   📎 Auto-mapped existing: '{task_name}' OF:{existing_of_task.id[:8]}... → Motion:{motion_id[:8]}...")
 
                             # Check completion sync for this newly-mapped pair
+                            # Skip repeating tasks — completing them in OF generates a new
+                            # instance, causing an infinite complete→regenerate→sync loop
                             if motion_completed and not existing_of_task.completed:
-                                reverse_sync_plan['of_tasks_to_complete'].append({
-                                    'of_id': existing_of_task.id,
-                                    'motion_id': motion_id,
-                                    'task_name': task_name,
-                                    'workspace': ws_name,
-                                    'project': proj_name
-                                })
+                                if existing_of_task.repeat_rule:
+                                    logger.debug(f"   🔁 Skipping repeating task completion: '{task_name}' (complete in OF directly)")
+                                else:
+                                    reverse_sync_plan['of_tasks_to_complete'].append({
+                                        'of_id': existing_of_task.id,
+                                        'motion_id': motion_id,
+                                        'task_name': task_name,
+                                        'workspace': ws_name,
+                                        'project': proj_name
+                                    })
                         elif not motion_completed:
                             # Truly new Motion-only task → create in OmniFocus
                             of_folder = reverse_ws_mapping.get(ws_name, ws_name)
@@ -1469,14 +1480,19 @@ class MotionHybridSync:
                         continue
 
                     # Check if Motion task is completed but OmniFocus task isn't
+                    # Skip repeating tasks — completing them in OF generates a new
+                    # instance, causing an infinite complete→regenerate→sync loop
                     if motion_completed and not of_task.completed:
-                        reverse_sync_plan['of_tasks_to_complete'].append({
-                            'of_id': of_id,
-                            'motion_id': motion_id,
-                            'task_name': task_name,
-                            'workspace': ws_name,
-                            'project': proj_name
-                        })
+                        if of_task.repeat_rule:
+                            logger.debug(f"   🔁 Skipping repeating task completion: '{task_name}' (complete in OF directly)")
+                        else:
+                            reverse_sync_plan['of_tasks_to_complete'].append({
+                                'of_id': of_id,
+                                'motion_id': motion_id,
+                                'task_name': task_name,
+                                'workspace': ws_name,
+                                'project': proj_name
+                            })
 
                     # Check if Motion fields changed more recently than OF
                     elif not of_task.completed and not motion_completed:
@@ -1497,7 +1513,11 @@ class MotionHybridSync:
                                 if motion_due and motion_due < '2001-01-01':
                                     motion_due = ''  # Filter sentinel placeholder
                                 of_due = of_task.due_date or ''
-                                if motion_due != of_due:
+                                if motion_due != of_due and of_due:
+                                    # Only reverse-sync due date when OF already has one
+                                    # (date change). Skip when OF has no due date — the
+                                    # user intentionally cleared it and Motion may not
+                                    # accept null for auto-scheduled tasks.
                                     updates['due_date'] = motion_due if motion_due else None
                                     field_changes.append('due date')
 
